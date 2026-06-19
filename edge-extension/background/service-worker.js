@@ -102,9 +102,9 @@ async function handleStartCapture(request, tabId, sendResponse) {
     captureState.pageInfo = pageInfo;
     captureState.capturePlan = capturePlan;
 
-    // 3a. 如需保留页眉页脚，在隐藏 fixed 前先截一帧"上下文帧"
+    // 3a. 如需保留页眉页脚，在隐藏 fixed 前先截一帧"上下文帧"（完整视口）
     let contextFrame = null;
-    if (options.keepHeaderFooter && (capturePlan.headerRegion || capturePlan.footerRegion)) {
+    if (options.keepHeaderFooter && capturePlan.cropRect) {
       const dataUrl = await captureVisibleTab();
       if (dataUrl) contextFrame = dataUrl;
     }
@@ -155,8 +155,6 @@ async function handleStartCapture(request, tabId, sendResponse) {
       format,
       cropRect: capturePlan.cropRect || null,
       contextFrame,
-      headerRegion: capturePlan.headerRegion || null,
-      footerRegion: capturePlan.footerRegion || null,
     });
 
     if (!stitchResult?.success) {

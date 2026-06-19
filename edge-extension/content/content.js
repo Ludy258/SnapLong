@@ -146,51 +146,6 @@ function scanFixedElements() {
 }
 
 /**
- * 从已扫描的 fixed 元素中识别页眉区域（视口顶部的固定导航/工具栏）
- * @returns {{top:number, left:number, width:number, height:number}|null}
- */
-function identifyFixedHeaderRegion() {
-  const vw = window.innerWidth;
-  let headerBottom = 0;
-  for (const item of fixedElements) {
-    const r = item.rect;
-    if (r.top <= 10 && r.width > vw * 0.5 && r.height > 5) {
-      headerBottom = Math.max(headerBottom, Math.round(r.bottom));
-    }
-  }
-  if (headerBottom <= 0) return null;
-  return {
-    top: 0,
-    left: 0,
-    width: vw,
-    height: Math.min(headerBottom, Math.round(window.innerHeight * 0.4)),
-  };
-}
-
-/**
- * 从已扫描的 fixed 元素中识别页脚区域（视口底部的固定栏）
- * @returns {{top:number, left:number, width:number, height:number}|null}
- */
-function identifyFixedFooterRegion() {
-  const vw = window.innerWidth;
-  const vh = window.innerHeight;
-  let footerTop = vh;
-  for (const item of fixedElements) {
-    const r = item.rect;
-    if (r.bottom >= vh - 10 && r.width > vw * 0.5 && r.height > 5) {
-      footerTop = Math.min(footerTop, Math.round(r.top));
-    }
-  }
-  if (footerTop >= vh) return null;
-  return {
-    top: footerTop,
-    left: 0,
-    width: vw,
-    height: Math.min(Math.round(vh - footerTop), Math.round(vh * 0.4)),
-  };
-}
-
-/**
  * 临时隐藏 fixed/sticky 元素
  */
 function hideFixedElements() {
@@ -434,8 +389,6 @@ async function handleStartCapture(request, sendResponse) {
 
     // 获取容器裁剪区域（自定义滚动容器需要裁剪去除非容器内容）
     let cropRect = null;
-    let headerRegion = null;
-    let footerRegion = null;
     const container = getScrollContainer();
     const isNative = container === window || container === document.documentElement || container === document.body;
     if (!isNative) {
@@ -446,14 +399,7 @@ async function handleStartCapture(request, sendResponse) {
         width: Math.round(r.width),
         height: Math.round(r.height),
       };
-
-      // 当启用保留页眉页脚时，识别 fixed 元素组成的页眉/页脚区域
-      if (options.keepHeaderFooter && fixedElements.length > 0) {
-        headerRegion = identifyFixedHeaderRegion();
-        footerRegion = identifyFixedFooterRegion();
-      }
     }
-
     sendResponse({
       success: true,
       positions,
@@ -464,8 +410,6 @@ async function handleStartCapture(request, sendResponse) {
       fixedElementCount: fixedElements.length,
       stepHeight,
       cropRect,
-      headerRegion,
-      footerRegion,
     });
   } catch (error) {
     sendResponse({ success: false, error: error.message });
