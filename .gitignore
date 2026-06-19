@@ -12,3 +12,6 @@ Gemini_Generated_*.png
 
 # 打包输出
 *.zip
+
+# 截图（不该上传的）
+屏幕截图*.png
