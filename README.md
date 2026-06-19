@@ -48,7 +48,7 @@ Edge 浏览器扩展（Manifest V3）。
 - **Manifest V3** — 最新扩展标准
 - **Service Worker** — 后台截图协调
 - **Offscreen Document** — Canvas 拼接 + PDF 生成
-- **纯 JavaScript** — 无三方框架，仅 20KB
+- **纯 JavaScript** — 无三方框架，仅 ~80KB
 
 ## 反馈
 
