@@ -1,0 +1,55 @@
+{
+  "manifest_version": 3,
+  "name": "PrintScreen 长截图",
+  "version": "1.0.0",
+  "description": "一键滚动截取整个网页，支持 PNG/JPEG/PDF 导出",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "downloads",
+    "storage",
+    "offscreen"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "commands": {
+    "_execute_action": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+S",
+        "mac": "MacCtrl+Shift+S"
+      },
+      "description": "打开 PrintScreen 弹窗"
+    },
+    "capture-long-screenshot": {
+      "suggested_key": {
+        "default": "Alt+Shift+S"
+      },
+      "description": "一键截取长图（跳过弹窗）"
+    }
+  },
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "PrintScreen 长截图",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background/service-worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content/content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

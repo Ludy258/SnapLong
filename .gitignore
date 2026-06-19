@@ -1,0 +1,14 @@
+# 系统
+.DS_Store
+Thumbs.db
+
+# Python 生成图标脚本（如果有）
+__pycache__/
+*.pyc
+
+# 生成的大图（非扩展必需的）
+Icons.png
+Gemini_Generated_*.png
+
+# 打包输出
+*.zip
