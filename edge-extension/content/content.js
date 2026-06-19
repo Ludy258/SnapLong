@@ -9,29 +9,106 @@
  */
 
 let fixedElements = [];
+let scrollContainers = [];
+let selectedContainerIndex = 0;
 
 // ===================== 工具函数 =====================
 
 /**
+ * 检测页面中所有可滚动的容器
+ * 返回排序后的候选列表（scrollHeight 从大到小），排除狭窄元素（侧边栏）
+ */
+function detectScrollContainers() {
+  const containers = [];
+  const vw = window.innerWidth;
+  const se = document.scrollingElement || document.documentElement;
+
+  // 检查标准 viewport 滚动
+  if (se.scrollHeight > se.clientHeight + 10) {
+    containers.push({
+      element: se,
+      scrollHeight: se.scrollHeight,
+      scrollWidth: se.scrollWidth,
+      clientHeight: se.clientHeight,
+      clientWidth: se.clientWidth,
+      tagName: se.tagName.toLowerCase(),
+      selector: '页面（默认滚动）',
+    });
+  }
+
+  // 查找自定义滚动容器（overflow-y: auto/scroll）
+  const allEls = document.querySelectorAll('*');
+  for (const el of allEls) {
+    const style = window.getComputedStyle(el);
+    const oy = style.overflowY;
+    if ((oy === 'auto' || oy === 'scroll') &&
+        el.scrollHeight > el.clientHeight + 5 &&
+        el.offsetWidth > 0 && el.offsetHeight > 0) {
+      // 跳过窄元素（很可能是侧边栏）
+      if (el.clientWidth < vw * 0.3 && el.clientWidth < 250) continue;
+
+      // 生成可读的描述
+      let sel = el.tagName.toLowerCase();
+      if (el.id) sel += `#${el.id}`;
+      else if (el.className && typeof el.className === 'string') {
+        const firstClass = el.className.trim().split(/\s+/)[0];
+        if (firstClass) sel += `.${firstClass}`;
+      }
+
+      containers.push({
+        element: el,
+        scrollHeight: el.scrollHeight,
+        scrollWidth: el.scrollWidth,
+        clientHeight: el.clientHeight,
+        clientWidth: el.clientWidth,
+        tagName: el.tagName.toLowerCase(),
+        selector: sel,
+      });
+    }
+  }
+
+  // 按 scrollHeight 降序排列
+  containers.sort((a, b) => b.scrollHeight - a.scrollHeight);
+  containers.forEach((c, i) => c.index = i);
+
+  return containers;
+}
+
+/**
+ * 获取当前选中的滚动容器 DOM 元素
+ */
+function getScrollContainer() {
+  if (scrollContainers.length === 0) return window;
+  const c = scrollContainers[selectedContainerIndex];
+  return c ? c.element : window;
+}
+
+/**
  * 获取页面的完整滚动尺寸
+ * 自动使用检测到的滚动容器（支持自定义滚动区域）
  */
 function getPageDimensions() {
-  const body = document.body;
-  const html = document.documentElement;
+  const container = getScrollContainer();
+  const isNative = container === window || container === document.documentElement || container === document.body;
+
+  let scrollW, scrollH, viewH;
+  if (isNative) {
+    const body = document.body;
+    const html = document.documentElement;
+    scrollW = Math.max(body.scrollWidth, html.scrollWidth, body.offsetWidth, html.offsetWidth, body.clientWidth, html.clientWidth);
+    scrollH = Math.max(body.scrollHeight, html.scrollHeight, body.offsetHeight, html.offsetHeight, body.clientHeight, html.clientHeight);
+    viewH = window.innerHeight;
+  } else {
+    scrollW = container.scrollWidth;
+    scrollH = container.scrollHeight;
+    viewH = container.clientHeight;
+  }
 
   return {
-    scrollWidth: Math.max(
-      body.scrollWidth, html.scrollWidth,
-      body.offsetWidth, html.offsetWidth,
-      body.clientWidth, html.clientWidth
-    ),
-    scrollHeight: Math.max(
-      body.scrollHeight, html.scrollHeight,
-      body.offsetHeight, html.offsetHeight,
-      body.clientHeight, html.clientHeight
-    ),
+    scrollWidth: scrollW,
+    scrollHeight: scrollH,
     viewportWidth: window.innerWidth,
-    viewportHeight: window.innerHeight,
+    viewportHeight: viewH,
     devicePixelRatio: window.devicePixelRatio || 1
   };
 }
@@ -95,11 +172,19 @@ async function preScrollForLazyLoad() {
   const totalScroll = scrollHeight - viewportHeight;
   const step = viewportHeight;
 
+  const container = getScrollContainer();
+  const isNative = container === window || container === document.documentElement || container === document.body;
+
+  function doScroll(y) {
+    if (isNative) window.scrollTo(0, y);
+    else container.scrollTop = y;
+  }
+
   // 向下快速滚动
   let currentScroll = 0;
   while (currentScroll < totalScroll) {
     currentScroll = Math.min(currentScroll + step, totalScroll);
-    window.scrollTo(0, currentScroll);
+    doScroll(currentScroll);
     // 触发 IntersectionObserver 等懒加载机制
     document.dispatchEvent(new Event('scroll'));
     // 小延迟让懒加载触发
@@ -113,7 +198,7 @@ async function preScrollForLazyLoad() {
   await sleep(500);
 
   // 滚回顶部
-  window.scrollTo(0, 0);
+  doScroll(0);
   document.dispatchEvent(new Event('scroll'));
 
   // 等待顶部内容稳定
@@ -161,10 +246,19 @@ function waitForImagesLoaded() {
 
 /**
  * 滚动到指定位置并等待渲染完成
+ * 支持自定义滚动容器
  */
 function scrollToPosition(y) {
   return new Promise((resolve) => {
-    window.scrollTo(0, y);
+    const container = getScrollContainer();
+    const isNative = container === window || container === document.documentElement || container === document.body;
+
+    if (isNative) {
+      window.scrollTo(0, y);
+    } else {
+      container.scrollTop = y;
+    }
+
     document.dispatchEvent(new Event('scroll'));
 
     // 等待两次 requestAnimationFrame 确保渲染完成
@@ -219,21 +313,47 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 });
 
 function handleGetPageInfo(sendResponse) {
+  // 检测滚动容器
+  scrollContainers = detectScrollContainers();
+  selectedContainerIndex = 0;
+
   const dims = getPageDimensions();
   const fixedCount = scanFixedElements();
+
+  // 返回容器列表（不含 DOM 引用，可序列化）
+  const containerList = scrollContainers.map(c => ({
+    index: c.index,
+    scrollHeight: c.scrollHeight,
+    scrollWidth: c.scrollWidth,
+    clientWidth: c.clientWidth,
+    tagName: c.tagName,
+    selector: c.selector,
+  }));
 
   sendResponse({
     success: true,
     dimensions: dims,
     fixedElementCount: fixedCount,
     url: location.href,
-    title: document.title
+    title: document.title,
+    scrollContainers: containerList,
+    autoSelectedIndex: 0,
   });
 }
 
 async function handleStartCapture(request, sendResponse) {
   try {
     const options = request.options || {};
+
+    // 重新检测滚动容器（如果尚未检测）
+    if (scrollContainers.length === 0) {
+      scrollContainers = detectScrollContainers();
+    }
+
+    // 使用用户选择的滚动容器（如有指定）
+    if (options.scrollContainerIndex !== undefined && scrollContainers[options.scrollContainerIndex]) {
+      selectedContainerIndex = options.scrollContainerIndex;
+    }
 
     // 扫描 fixed 元素
     scanFixedElements();

@@ -27,10 +27,13 @@ document.addEventListener('DOMContentLoaded', () => {
   const shortcutLink = document.getElementById('shortcutSettingsLink');
   const container = document.querySelector('.container');
   const themeSegments = document.querySelectorAll('#themeSelect .seg-option');
+  const containerSection = document.getElementById('containerSection');
+  const containerSelect = document.getElementById('containerSelect');
 
   let isCapturing = false;
   let currentFormat = 'png';
   let currentTheme = 'auto';
+  let scrollContainerIndex = 0;
 
   // 应用主题
   function applyTheme(mode) {
@@ -180,6 +183,9 @@ document.addEventListener('DOMContentLoaded', () => {
         const d = resp.dimensions;
         setBadge(`${d.scrollWidth}×${d.scrollHeight}`, 'loaded');
         btnCapture.disabled = btnViewport.disabled = false;
+
+        // 处理多滚动容器选择
+        updateContainerSelector(resp.scrollContainers);
       } else {
         setBadge('无法获取页面信息', 'error');
       }
@@ -187,6 +193,45 @@ document.addEventListener('DOMContentLoaded', () => {
       setBadge('连接失败', 'error');
       console.error(e);
     }
+  }
+
+  /**
+   * 更新滚动容器选择器
+   * 当页面有多个可滚动区域时显示供用户选择
+   */
+  function updateContainerSelector(containers) {
+    if (!containerSection || !containerSelect) return;
+
+    // 清空并重置
+    containerSelect.innerHTML = '';
+    scrollContainerIndex = 0;
+
+    // 只有多容器时才显示选择器
+    if (!containers || containers.length <= 1) {
+      containerSection.style.display = 'none';
+      return;
+    }
+
+    // 填充选项
+    for (const c of containers) {
+      const opt = document.createElement('option');
+      opt.value = c.index;
+      const sizeLabel = c.scrollWidth > 9999
+        ? `${(c.scrollWidth / 1000).toFixed(0)}k×${(c.scrollHeight / 1000).toFixed(0)}k`
+        : `${c.scrollWidth}×${c.scrollHeight}`;
+      opt.textContent = `${c.selector} (${sizeLabel})`;
+      containerSelect.appendChild(opt);
+    }
+
+    containerSelect.value = '0';
+    containerSection.style.display = 'block';
+  }
+
+  // 容器选择变更
+  if (containerSelect) {
+    containerSelect.addEventListener('change', () => {
+      scrollContainerIndex = parseInt(containerSelect.value) || 0;
+    });
   }
 
   function setBadge(text, type) {
@@ -224,7 +269,8 @@ document.addEventListener('DOMContentLoaded', () => {
         scrollDelay: parseInt(delayInput.value),
         preScroll: true,
         savePath: savePathInput.value.trim() || 'SnapLong',
-        saveAs: saveAsCheck.checked
+        saveAs: saveAsCheck.checked,
+        scrollContainerIndex: scrollContainerIndex
       };
 
       const response = await chrome.runtime.sendMessage({
