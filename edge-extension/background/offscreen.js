@@ -19,14 +19,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
 async function handleStitch(request, sendResponse) {
   try {
-    const { frames, viewportWidth, viewportHeight, devicePixelRatio, format, cropRect } = request;
+    const { frames, viewportWidth, viewportHeight, devicePixelRatio, format, cropRect,
+            contextFrame, headerRegion, footerRegion } = request;
 
     if (!frames || frames.length === 0) throw new Error('No frames');
 
     console.log('[Offscreen] Stitching', frames.length, 'frames...');
 
-    // 加载所有图片
-    const images = await Promise.all(frames.map(d => loadImage(d.dataUrl)));
+    // 加载容器滚动帧
+    let images = await Promise.all(frames.map(d => loadImage(d.dataUrl)));
 
     // 如果指定了裁剪区域（用于自定义滚动容器），裁剪每帧到容器可见区域
     if (cropRect) {
@@ -36,15 +37,52 @@ async function handleStitch(request, sendResponse) {
       }
     }
 
+    // 计算容器帧拼接偏移
+    const containerOffsets = calculateOffsets(images, frames);
+    const dpr = devicePixelRatio || 1;
+
+    // === 处理页眉页脚（保留上下文帧的非容器区域） ===
+    let allImages = [];
+    let allOffsets = [];
+    let headerHeightPx = 0;
+
+    if (contextFrame && (headerRegion || footerRegion)) {
+      const contextImg = await loadImage(contextFrame);
+
+      // 提取页眉区域（视口顶部到容器顶部）
+      if (headerRegion) {
+        const headerImg = cropToRect(contextImg, headerRegion, dpr);
+        headerHeightPx = headerImg.height;
+        allImages.push(headerImg);
+        allOffsets.push(0);
+      }
+
+      // 容器帧（偏移量加上页眉高度）
+      for (let i = 0; i < images.length; i++) {
+        allImages.push(images[i]);
+        allOffsets.push(containerOffsets[i] + headerHeightPx);
+      }
+
+      // 提取页脚区域（容器底部到视口底部）
+      if (footerRegion) {
+        const footerImg = cropToRect(contextImg, footerRegion, dpr);
+        allImages.push(footerImg);
+        const lastBottom = allOffsets[allOffsets.length - 1] + images[images.length - 1].height;
+        allOffsets.push(lastBottom);
+      }
+    } else {
+      // 无页眉页脚，直接使用容器帧
+      allImages = images;
+      allOffsets = containerOffsets;
+    }
+
     // 计算最终尺寸
     const imageWidth = cropRect
-      ? Math.round(cropRect.width * devicePixelRatio)
-      : Math.round(viewportWidth * devicePixelRatio);
+      ? Math.round(cropRect.width * dpr)
+      : Math.round(viewportWidth * dpr);
 
-    // 计算每帧偏移
-    const offsets = calculateOffsets(images, frames);
-    const lastImg = images[images.length - 1];
-    const lastOffset = offsets[offsets.length - 1] || 0;
+    const lastImg = allImages[allImages.length - 1];
+    const lastOffset = allOffsets[allOffsets.length - 1] || 0;
     const imageHeight = lastOffset + lastImg.height;
 
     console.log('[Offscreen] Size:', imageWidth, 'x', imageHeight);
@@ -52,15 +90,14 @@ async function handleStitch(request, sendResponse) {
     let canvas;
     if (imageWidth > MAX_CANVAS_SIZE || imageHeight > MAX_CANVAS_SIZE ||
         imageWidth * imageHeight > MAX_CANVAS_AREA) {
-      canvas = stitchWithSlicing(images, offsets, imageWidth, imageHeight);
+      canvas = stitchWithSlicing(allImages, allOffsets, imageWidth, imageHeight);
     } else {
-      canvas = stitchToCanvas(images, offsets, imageWidth, imageHeight);
+      canvas = stitchToCanvas(allImages, allOffsets, imageWidth, imageHeight);
     }
 
     // 根据格式处理
     let dataUrl;
     if (format === 'pdf') {
-      // PDF：先生成 JPEG，再包装成 PDF
       const jpegDataUrl = canvas.toDataURL('image/jpeg', 0.9);
       dataUrl = generateSimplePdf(jpegDataUrl, canvas.width, canvas.height);
     } else {
@@ -70,7 +107,7 @@ async function handleStitch(request, sendResponse) {
     }
 
     // 清理
-    images.forEach(img => {
+    allImages.forEach(img => {
       if (img._canvas) { img._canvas = null; img._ctx = null; img._imageData = null; img._pixels = null; }
     });
 

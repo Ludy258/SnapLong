@@ -49,7 +49,7 @@ chrome.commands.onCommand.addListener(async (command) => {
 
       // 读取保存的设置，直接启动截图（避免自消息不可靠）
       const saved = await chrome.storage.local.get({
-        format: 'png', scrollDelay: 500, savePath: 'SnapLong', saveAs: false
+        format: 'png', scrollDelay: 500, savePath: 'SnapLong', saveAs: false, keepHeaderFooter: false
       });
 
       handleStartCapture(
@@ -60,6 +60,7 @@ chrome.commands.onCommand.addListener(async (command) => {
             preScroll: true,
             savePath: saved.savePath,
             saveAs: saved.saveAs,
+            keepHeaderFooter: saved.keepHeaderFooter,
           }
         },
         tab.id,
@@ -101,7 +102,14 @@ async function handleStartCapture(request, tabId, sendResponse) {
     captureState.pageInfo = pageInfo;
     captureState.capturePlan = capturePlan;
 
-    // 3. 隐藏 fixed 元素
+    // 3a. 如需保留页眉页脚，在隐藏 fixed 前先截一帧"上下文帧"
+    let contextFrame = null;
+    if (options.keepHeaderFooter && (capturePlan.headerRegion || capturePlan.footerRegion)) {
+      const dataUrl = await captureVisibleTab();
+      if (dataUrl) contextFrame = dataUrl;
+    }
+
+    // 3b. 隐藏 fixed 元素
     if (capturePlan.fixedElementCount > 0) {
       try { await sendMessageToTab(tabId, { action: 'hideFixed' }); } catch (e) {}
     }
@@ -146,6 +154,9 @@ async function handleStartCapture(request, tabId, sendResponse) {
       devicePixelRatio: capturePlan.devicePixelRatio || 1,
       format,
       cropRect: capturePlan.cropRect || null,
+      contextFrame,
+      headerRegion: capturePlan.headerRegion || null,
+      footerRegion: capturePlan.footerRegion || null,
     });
 
     if (!stitchResult?.success) {

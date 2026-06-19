@@ -29,6 +29,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const themeSegments = document.querySelectorAll('#themeSelect .seg-option');
   const containerSection = document.getElementById('containerSection');
   const containerSelect = document.getElementById('containerSelect');
+  const keepHeaderFooterCheck = document.getElementById('keepHeaderFooterCheck');
 
   let isCapturing = false;
   let currentFormat = 'png';
@@ -54,7 +55,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // 恢复保存的设置
   chrome.storage.local.get({
-    savePath: '', saveAs: false, format: 'png', scrollDelay: 500, theme: 'auto'
+    savePath: '', saveAs: false, format: 'png', scrollDelay: 500, theme: 'auto', keepHeaderFooter: false
   }, (saved) => {
     if (saved.savePath) savePathInput.value = saved.savePath;
     saveAsCheck.checked = saved.saveAs;
@@ -69,6 +70,9 @@ document.addEventListener('DOMContentLoaded', () => {
     currentTheme = saved.theme || 'auto';
     themeSegments.forEach(b => b.classList.toggle('active', b.dataset.value === currentTheme));
     applyTheme(currentTheme);
+
+    // 恢复保留页眉页脚
+    if (saved.keepHeaderFooter) keepHeaderFooterCheck.checked = true;
   });
 
   // ===================== 快捷键 =====================
@@ -101,12 +105,14 @@ document.addEventListener('DOMContentLoaded', () => {
       saveAs: saveAsCheck.checked,
       format: currentFormat,
       scrollDelay: parseInt(delayInput.value) || 500,
-      theme: currentTheme
+      theme: currentTheme,
+      keepHeaderFooter: keepHeaderFooterCheck.checked
     });
   }
 
   savePathInput.addEventListener('input', () => { updateSavePathHint(); saveOptions(); });
   saveAsCheck.addEventListener('change', () => { updateSavePathHint(); saveOptions(); });
+  keepHeaderFooterCheck.addEventListener('change', saveOptions);
 
   // 主题切换
   themeSegments.forEach(btn => {
@@ -270,7 +276,8 @@ document.addEventListener('DOMContentLoaded', () => {
         preScroll: true,
         savePath: savePathInput.value.trim() || 'SnapLong',
         saveAs: saveAsCheck.checked,
-        scrollContainerIndex: scrollContainerIndex
+        scrollContainerIndex: scrollContainerIndex,
+        keepHeaderFooter: keepHeaderFooterCheck.checked
       };
 
       const response = await chrome.runtime.sendMessage({
