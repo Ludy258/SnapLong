@@ -145,6 +145,7 @@ async function handleStartCapture(request, tabId, sendResponse) {
       viewportHeight: capturePlan.viewportHeight,
       devicePixelRatio: capturePlan.devicePixelRatio || 1,
       format,
+      cropRect: capturePlan.cropRect || null,
     });
 
     if (!stitchResult?.success) {

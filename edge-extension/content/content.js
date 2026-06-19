@@ -387,6 +387,20 @@ async function handleStartCapture(request, sendResponse) {
       positions.pop();
     }
 
+    // 获取容器裁剪区域（自定义滚动容器需要裁剪去除非容器内容）
+    let cropRect = null;
+    const container = getScrollContainer();
+    const isNative = container === window || container === document.documentElement || container === document.body;
+    if (!isNative) {
+      const r = container.getBoundingClientRect();
+      cropRect = {
+        top: Math.round(r.top),
+        left: Math.round(r.left),
+        width: Math.round(r.width),
+        height: Math.round(r.height),
+      };
+    }
+
     sendResponse({
       success: true,
       positions,
@@ -395,7 +409,8 @@ async function handleStartCapture(request, sendResponse) {
       viewportWidth: dims.viewportWidth,
       devicePixelRatio: dims.devicePixelRatio,
       fixedElementCount: fixedElements.length,
-      stepHeight
+      stepHeight,
+      cropRect,
     });
   } catch (error) {
     sendResponse({ success: false, error: error.message });

@@ -19,7 +19,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
 async function handleStitch(request, sendResponse) {
   try {
-    const { frames, viewportWidth, viewportHeight, devicePixelRatio, format } = request;
+    const { frames, viewportWidth, viewportHeight, devicePixelRatio, format, cropRect } = request;
 
     if (!frames || frames.length === 0) throw new Error('No frames');
 
@@ -28,8 +28,18 @@ async function handleStitch(request, sendResponse) {
     // 加载所有图片
     const images = await Promise.all(frames.map(d => loadImage(d.dataUrl)));
 
+    // 如果指定了裁剪区域（用于自定义滚动容器），裁剪每帧到容器可见区域
+    if (cropRect) {
+      console.log('[Offscreen] Cropping to container:', cropRect);
+      for (let i = 0; i < images.length; i++) {
+        images[i] = cropToRect(images[i], cropRect, devicePixelRatio);
+      }
+    }
+
     // 计算最终尺寸
-    const imageWidth = Math.round(viewportWidth * devicePixelRatio);
+    const imageWidth = cropRect
+      ? Math.round(cropRect.width * devicePixelRatio)
+      : Math.round(viewportWidth * devicePixelRatio);
 
     // 计算每帧偏移
     const offsets = calculateOffsets(images, frames);
@@ -151,6 +161,26 @@ function stitchWithSlicing(images, offsets, width, height) {
   // 超长图：只保留最后一张拼接结果作为缩略图
   console.warn('[Offscreen] Image too large, returning last slice');
   return stitchToCanvas(images, offsets, width, height);
+}
+
+/**
+ * 裁剪图片到指定区域
+ * @param {HTMLImageElement} image - 原始图片
+ * @param {{top:number, left:number, width:number, height:number}} rect - CSS 像素坐标的裁剪区域
+ * @param {number} dpr - 设备像素比
+ * @returns {HTMLCanvasElement} 裁剪后的 canvas
+ */
+function cropToRect(image, rect, dpr) {
+  const sx = Math.round(rect.left * dpr);
+  const sy = Math.round(rect.top * dpr);
+  const sw = Math.round(rect.width * dpr);
+  const sh = Math.round(rect.height * dpr);
+  const canvas = document.createElement('canvas');
+  canvas.width = sw;
+  canvas.height = sh;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(image, sx, sy, sw, sh, 0, 0, sw, sh);
+  return canvas;
 }
 
 console.log('[Offscreen] Ready');
