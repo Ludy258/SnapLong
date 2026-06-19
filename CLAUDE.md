@@ -1,4 +1,4 @@
-# PrintScreen 长截图
+# SnapLong
 
 Edge 浏览器扩展（Manifest V3），一键滚动截取整个网页，支持 PNG / JPEG / PDF 导出。
 
@@ -27,7 +27,7 @@ edge-extension/
 - **长截图**：自动滚动截取整个页面，20% 重叠区域像素匹配拼接
 - **可视区域截图**：一键截取当前屏幕可见区域
 - **导出格式**：PNG / JPEG / PDF（PDF 手动构造，内嵌 JPEG）
-- **保存路径**：`~/Downloads/PrintScreen/` 可自定义子文件夹
+- **保存路径**：`~/Downloads/SnapLong/` 可自定义子文件夹
 - **每次询问**：可选每次都弹出"另存为"对话框
 - **快捷键**：`Ctrl+Shift+S` 打开弹窗，`Alt+Shift+S` 一键截长图（可在 `edge://extensions/shortcuts` 自定义）
 - **三档主题**：自动（跟随系统）/ 浅色 / 深色
@@ -60,7 +60,7 @@ edge-extension/
 # 2. 加载解压缩的扩展 → 选择 edge-extension 文件夹
 
 # 打包
-# Compress-Archive -Path 'edge-extension/*' -DestinationPath 'PrintScreen-extension.zip' -Force
+# Compress-Archive -Path 'edge-extension/*' -DestinationPath 'SnapLong-extension.zip' -Force
 ```
 
 ## 联系方式

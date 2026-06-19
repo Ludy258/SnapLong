@@ -1,5 +1,5 @@
 /**
- * Popup - PrintScreen 长截图
+ * Popup - SnapLong
  */
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -120,7 +120,7 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   function updateSavePathHint() {
-    const folder = savePathInput.value.trim() || 'PrintScreen';
+    const folder = savePathInput.value.trim() || 'SnapLong';
     savePathHint.textContent = saveAsCheck.checked
       ? `📂 ~/Downloads/${folder}/  (每次询问)`
       : `📁 ~/Downloads/${folder}/`;
@@ -223,7 +223,7 @@ document.addEventListener('DOMContentLoaded', () => {
         format: currentFormat,
         scrollDelay: parseInt(delayInput.value),
         preScroll: true,
-        savePath: savePathInput.value.trim() || 'PrintScreen',
+        savePath: savePathInput.value.trim() || 'SnapLong',
         saveAs: saveAsCheck.checked
       };
 

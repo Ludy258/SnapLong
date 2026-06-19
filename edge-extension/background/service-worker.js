@@ -1,5 +1,5 @@
 /**
- * Service Worker - PrintScreen 长截图
+ * Service Worker - SnapLong
  *
  * Manifest V3 Service Worker
  * 负责：协调截图 → 委托 offscreen 拼接 → SW 下载
@@ -34,7 +34,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
 chrome.commands.onCommand.addListener(async (command) => {
   if (command === 'capture-long-screenshot') {
-    console.log('[PrintScreen] Shortcut triggered: capture-long-screenshot');
+    console.log('[SnapLong] Shortcut triggered: capture-long-screenshot');
     try {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       if (!tab || !tab.id) return;
@@ -49,7 +49,7 @@ chrome.commands.onCommand.addListener(async (command) => {
 
       // 读取保存的设置，直接启动截图（避免自消息不可靠）
       const saved = await chrome.storage.local.get({
-        format: 'png', scrollDelay: 500, savePath: 'PrintScreen', saveAs: false
+        format: 'png', scrollDelay: 500, savePath: 'SnapLong', saveAs: false
       });
 
       handleStartCapture(
@@ -65,12 +65,12 @@ chrome.commands.onCommand.addListener(async (command) => {
         tab.id,
         (response) => {
           if (!response.success) {
-            console.error('[PrintScreen] Shortcut capture error:', response.error);
+            console.error('[SnapLong] Shortcut capture error:', response.error);
           }
         }
       );
     } catch (e) {
-      console.error('[PrintScreen] Shortcut error:', e);
+      console.error('[SnapLong] Shortcut error:', e);
     }
   }
 });
@@ -136,7 +136,7 @@ async function handleStartCapture(request, tabId, sendResponse) {
     await createOffscreen();
 
     const format = options.format || 'png';
-    console.log('[PrintScreen] Sending', captureState.frames.length, 'frames to offscreen...');
+    console.log('[SnapLong] Sending', captureState.frames.length, 'frames to offscreen...');
 
     const stitchResult = await chrome.runtime.sendMessage({
       action: 'stitch',
@@ -154,12 +154,12 @@ async function handleStartCapture(request, tabId, sendResponse) {
     // 7. 从 SW 直接下载（data URL 可直接传给 chrome.downloads.download）
     const dataUrl = stitchResult.dataUrl;
     const saveOptions = {
-      subfolder: options.savePath || 'PrintScreen',
+      subfolder: options.savePath || 'SnapLong',
       saveAs: options.saveAs === true
     };
     const filename = generateFilename(pageInfo.title || 'screenshot', format, saveOptions);
 
-    console.log('[PrintScreen] Downloading:', filename, 'size:', Math.round(dataUrl.length / 1024), 'KB');
+    console.log('[SnapLong] Downloading:', filename, 'size:', Math.round(dataUrl.length / 1024), 'KB');
 
     chrome.downloads.download({
       url: dataUrl,
@@ -167,9 +167,9 @@ async function handleStartCapture(request, tabId, sendResponse) {
       saveAs: saveOptions.saveAs,
     }, (downloadId) => {
       if (chrome.runtime.lastError) {
-        console.error('[PrintScreen] Download error:', chrome.runtime.lastError.message);
+        console.error('[SnapLong] Download error:', chrome.runtime.lastError.message);
       } else {
-        console.log('[PrintScreen] Download started, id:', downloadId);
+        console.log('[SnapLong] Download started, id:', downloadId);
       }
     });
 
@@ -177,7 +177,7 @@ async function handleStartCapture(request, tabId, sendResponse) {
     sendResponse({ success: true, totalCaptures: captureState.frames.length });
 
   } catch (error) {
-    console.error('[PrintScreen] Error:', error);
+    console.error('[SnapLong] Error:', error);
     cleanup();
     sendResponse({ success: false, error: error.message });
   }
@@ -194,7 +194,7 @@ async function createOffscreen() {
     reasons: ['DOM_SCRAPING', 'BLOBS'],
     justification: 'Stitch screenshots on canvas',
   });
-  console.log('[PrintScreen] Offscreen created');
+  console.log('[SnapLong] Offscreen created');
   await sleep(300);
 }
 
@@ -218,7 +218,7 @@ function sendMessageToTab(tabId, message) {
 function captureVisibleTab() {
   return new Promise((resolve) => {
     chrome.tabs.captureVisibleTab(null, { format: 'png' }, (dataUrl) => {
-      if (chrome.runtime.lastError) { console.error('[PrintScreen] captureVisibleTab error:', chrome.runtime.lastError.message); resolve(null); }
+      if (chrome.runtime.lastError) { console.error('[SnapLong] captureVisibleTab error:', chrome.runtime.lastError.message); resolve(null); }
       else { resolve(dataUrl); }
     });
   });
@@ -247,4 +247,4 @@ function notifyProgress(current, total) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-console.log('[PrintScreen] Service Worker loaded');
+console.log('[SnapLong] Service Worker loaded');

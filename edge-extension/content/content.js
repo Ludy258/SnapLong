@@ -1,5 +1,5 @@
 /**
- * Content Script - PrintScreen 长截图
+ * Content Script - SnapLong
  *
  * 运行在页面上下文中，负责：
  * - 检测页面尺寸和滚动信息
