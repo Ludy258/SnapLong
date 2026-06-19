@@ -350,66 +350,94 @@ async function handleStartCapture(request, sendResponse) {
       scrollContainers = detectScrollContainers();
     }
 
-    // 使用用户选择的滚动容器（如有指定）
-    if (options.scrollContainerIndex !== undefined && scrollContainers[options.scrollContainerIndex]) {
-      selectedContainerIndex = options.scrollContainerIndex;
+    // 确定要截取的容器列表
+    let indices;
+    if (options.scrollContainerIndices && options.scrollContainerIndices.length > 0) {
+      indices = options.scrollContainerIndices.filter(i => scrollContainers[i]);
+    } else if (options.scrollContainerIndex !== undefined && scrollContainers[options.scrollContainerIndex]) {
+      // 向后兼容：单容器模式
+      indices = [options.scrollContainerIndex];
+    } else {
+      // 默认：全选
+      indices = scrollContainers.map((_, i) => i);
     }
 
     // 扫描 fixed 元素
     scanFixedElements();
 
-    if (options.preScroll !== false) {
+    // 预滚动触发懒加载（用最大容器）
+    if (options.preScroll !== false && indices.length > 0) {
+      const saveIdx = selectedContainerIndex;
+      selectedContainerIndex = indices[0]; // 用第一个选中的做懒加载
       await preScrollForLazyLoad();
+      selectedContainerIndex = saveIdx;
     }
 
-    // 重新获取尺寸（懒加载后可能变化）
-    const dims = getPageDimensions();
+    // 为每个容器生成独立的 capture plan
+    const containerPlans = [];
 
-    // 计算滚动步进（viewport 高度的 80%，保留 20% 重叠用于拼接）
-    const stepHeight = Math.floor(dims.viewportHeight * 0.8);
-    const totalHeight = dims.scrollHeight;
-    const maxScroll = Math.max(0, totalHeight - dims.viewportHeight);
+    for (const idx of indices) {
+      selectedContainerIndex = idx;
+      const c = scrollContainers[idx];
+      if (!c) continue;
 
-    // 生成所有需要截图的位置
-    const positions = [];
-    let currentY = 0;
-    while (currentY < maxScroll) {
-      positions.push(currentY);
-      currentY += stepHeight;
-    }
-    // 确保最后一张截到底
-    if (positions.length === 0 || positions[positions.length - 1] < maxScroll) {
-      positions.push(maxScroll);
+      const isNative = c.element === window || c.element === document.documentElement || c.element === document.body;
+
+      // 容器尺寸
+      const viewH = isNative ? window.innerHeight : c.element.clientHeight;
+      const scrollH = isNative
+        ? Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)
+        : c.element.scrollHeight;
+      const maxScroll = Math.max(0, scrollH - viewH);
+
+      // 步进
+      const stepHeight = Math.floor(viewH * 0.8);
+
+      // 滚动位置列表
+      const positions = [];
+      let currentY = 0;
+      while (currentY < maxScroll) {
+        positions.push(currentY);
+        currentY += stepHeight;
+      }
+      if (positions.length === 0 || positions[positions.length - 1] < maxScroll) {
+        positions.push(maxScroll);
+      }
+      if (positions.length >= 2 && positions[positions.length - 1] === positions[positions.length - 2]) {
+        positions.pop();
+      }
+
+      // 裁剪区域
+      let cropRect = null;
+      if (!isNative) {
+        const r = c.element.getBoundingClientRect();
+        cropRect = {
+          top: Math.round(r.top),
+          left: Math.round(r.left),
+          width: Math.round(r.width),
+          height: Math.round(r.height),
+        };
+      }
+
+      containerPlans.push({
+        containerIndex: idx,
+        positions,
+        viewportWidth: window.innerWidth,
+        viewportHeight: viewH,
+        devicePixelRatio: window.devicePixelRatio || 1,
+        scalarHeight: scrollH,
+        isNative,
+        cropRect,
+      });
     }
 
-    // 去重最后一个位置（避免与倒数第二个相同）
-    if (positions.length >= 2 && positions[positions.length - 1] === positions[positions.length - 2]) {
-      positions.pop();
-    }
+    // 恢复默认选中
+    selectedContainerIndex = indices[0] || 0;
 
-    // 获取容器裁剪区域（自定义滚动容器需要裁剪去除非容器内容）
-    let cropRect = null;
-    const container = getScrollContainer();
-    const isNative = container === window || container === document.documentElement || container === document.body;
-    if (!isNative) {
-      const r = container.getBoundingClientRect();
-      cropRect = {
-        top: Math.round(r.top),
-        left: Math.round(r.left),
-        width: Math.round(r.width),
-        height: Math.round(r.height),
-      };
-    }
     sendResponse({
       success: true,
-      positions,
-      totalHeight,
-      viewportHeight: dims.viewportHeight,
-      viewportWidth: dims.viewportWidth,
-      devicePixelRatio: dims.devicePixelRatio,
+      containerPlans,
       fixedElementCount: fixedElements.length,
-      stepHeight,
-      cropRect,
     });
   } catch (error) {
     sendResponse({ success: false, error: error.message });
@@ -418,8 +446,16 @@ async function handleStartCapture(request, sendResponse) {
 
 async function handleScrollTo(request, sendResponse) {
   try {
-    await scrollToPosition(request.y);
-    sendResponse({ success: true, scrollY: window.scrollY });
+    // 支持指定容器索引（多容器模式）
+    if (request.containerIndex !== undefined && scrollContainers[request.containerIndex]) {
+      const prev = selectedContainerIndex;
+      selectedContainerIndex = request.containerIndex;
+      await scrollToPosition(request.y);
+      selectedContainerIndex = prev;
+    } else {
+      await scrollToPosition(request.y);
+    }
+    sendResponse({ success: true });
   } catch (error) {
     sendResponse({ success: false, error: error.message });
   }

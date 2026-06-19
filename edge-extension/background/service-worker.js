@@ -24,6 +24,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     case 'contentScriptReady':
       sendResponse({ success: true });
       return true;
+    case 'stitch':
+      // Handled by offscreen document — don't respond here
+      return true;
     default:
       sendResponse({ error: 'Unknown: ' + request.action });
       return true;
@@ -89,22 +92,25 @@ async function handleStartCapture(request, tabId, sendResponse) {
     const pageInfo = await sendMessageToTab(tabId, { action: 'getPageInfo' });
     if (!pageInfo?.success) throw new Error('Get page info failed: ' + (pageInfo?.error || 'no response'));
 
-    // 2. 准备截图
+    // 2. 准备截图（返回 containerPlans[]）
     const capturePlan = await sendMessageToTab(tabId, { action: 'startCapture', options });
     if (!capturePlan?.success) throw new Error('Prepare capture failed: ' + (capturePlan?.error || 'no response'));
+
+    const containerPlans = capturePlan.containerPlans || [];
+    if (containerPlans.length === 0) throw new Error('No containers to capture');
 
     captureState.isCapturing = true;
     captureState.tabId = tabId;
     captureState.options = options;
-    captureState.frames = [];
-    captureState.totalPositions = capturePlan.positions || [];
-    captureState.currentIndex = 0;
     captureState.pageInfo = pageInfo;
     captureState.capturePlan = capturePlan;
 
-    // 3a. 如需保留页眉页脚，在隐藏 fixed 前先截一帧"上下文帧"（完整视口）
+    const primaryIdx = options.primaryContainerIndex || 0;
+    const hasCustomContainer = containerPlans.some(p => p.cropRect);
+
+    // 3a. 上下文帧（完整视口，保留 fixed）
     let contextFrame = null;
-    if (options.keepHeaderFooter && capturePlan.cropRect) {
+    if (options.keepHeaderFooter && hasCustomContainer) {
       const dataUrl = await captureVisibleTab();
       if (dataUrl) contextFrame = dataUrl;
     }
@@ -114,22 +120,53 @@ async function handleStartCapture(request, tabId, sendResponse) {
       try { await sendMessageToTab(tabId, { action: 'hideFixed' }); } catch (e) {}
     }
 
-    // 4. 逐位置截图（间隔 500ms 避免限频）
-    for (let i = 0; i < captureState.totalPositions.length; i++) {
+    // 4. 为每个容器独立滚动截图
+    const containerStrips = [];
+    let globalFrameIdx = 0;
+
+    // 计算总帧数（用于进度）
+    const totalFrames = containerPlans.reduce((sum, p) => sum + p.positions.length, 0);
+
+    for (let ci = 0; ci < containerPlans.length; ci++) {
       if (!captureState.isCapturing) break;
-      captureState.currentIndex = i;
 
-      try { await sendMessageToTab(tabId, { action: 'scrollTo', y: captureState.totalPositions[i] }); } catch (e) {}
-      await sleep(500);
+      const plan = containerPlans[ci];
+      const frames = [];
 
-      const dataUrl = await captureVisibleTab();
-      if (dataUrl) {
-        captureState.frames.push({
-          dataUrl,
-          y: Math.round(captureState.totalPositions[i] * (capturePlan.devicePixelRatio || 1)),
+      for (let fi = 0; fi < plan.positions.length; fi++) {
+        if (!captureState.isCapturing) break;
+
+        const y = plan.positions[fi];
+        try {
+          await sendMessageToTab(tabId, { action: 'scrollTo', y, containerIndex: plan.containerIndex });
+        } catch (e) {}
+        await sleep(500);
+
+        const dataUrl = await captureVisibleTab();
+        if (dataUrl) {
+          frames.push({
+            dataUrl,
+            y: Math.round(y * (plan.devicePixelRatio || 1)),
+          });
+        }
+        globalFrameIdx++;
+        notifyProgress({
+          current: fi + 1,
+          total: plan.positions.length,
+          containerCurrent: ci + 1,
+          containerTotal: containerPlans.length,
+          percentage: Math.round((globalFrameIdx / totalFrames) * 100),
         });
       }
-      notifyProgress(i + 1, captureState.totalPositions.length);
+
+      if (frames.length > 0) {
+        containerStrips.push({
+          containerIndex: plan.containerIndex,
+          cropRect: plan.cropRect,
+          viewportHeight: plan.viewportHeight,
+          frames,
+        });
+      }
     }
 
     // 5. 恢复 fixed + 滚回顶部
@@ -138,22 +175,21 @@ async function handleStartCapture(request, tabId, sendResponse) {
       await sendMessageToTab(tabId, { action: 'scrollTo', y: 0 });
     } catch (e) {}
 
-    if (captureState.frames.length === 0) throw new Error('No frames captured');
+    if (containerStrips.length === 0) throw new Error('No frames captured');
 
-    // 6. 创建 offscreen 文档做拼接
+    // 6. 创建 offscreen 做拼接
     await createOffscreen();
 
     const format = options.format || 'png';
-    console.log('[SnapLong] Sending', captureState.frames.length, 'frames to offscreen...');
+    console.log('[SnapLong] Sending', containerStrips.length, 'container strips to offscreen...');
 
     const stitchResult = await chrome.runtime.sendMessage({
       action: 'stitch',
-      frames: captureState.frames.map(f => ({ dataUrl: f.dataUrl, y: f.y })),
-      viewportWidth: capturePlan.viewportWidth,
-      viewportHeight: capturePlan.viewportHeight,
-      devicePixelRatio: capturePlan.devicePixelRatio || 1,
+      containerStrips,
+      primaryContainerIndex: primaryIdx,
+      viewportWidth: pageInfo.dimensions?.viewportWidth || containerPlans[0]?.viewportWidth,
+      devicePixelRatio: containerPlans[0]?.devicePixelRatio || 1,
       format,
-      cropRect: capturePlan.cropRect || null,
       contextFrame,
     });
 
@@ -161,7 +197,7 @@ async function handleStartCapture(request, tabId, sendResponse) {
       throw new Error('Stitch failed: ' + (stitchResult?.error || 'unknown'));
     }
 
-    // 7. 从 SW 直接下载（data URL 可直接传给 chrome.downloads.download）
+    // 7. 下载
     const dataUrl = stitchResult.dataUrl;
     const saveOptions = {
       subfolder: options.savePath || 'SnapLong',
@@ -184,7 +220,7 @@ async function handleStartCapture(request, tabId, sendResponse) {
     });
 
     cleanup();
-    sendResponse({ success: true, totalCaptures: captureState.frames.length });
+    sendResponse({ success: true, totalFrames: globalFrameIdx });
 
   } catch (error) {
     console.error('[SnapLong] Error:', error);
@@ -251,8 +287,11 @@ function cleanup() {
   closeOffscreen();
 }
 
-function notifyProgress(current, total) {
-  chrome.runtime.sendMessage({ action: 'captureProgress', current, total, percentage: Math.round((current / total) * 100) }).catch(() => {});
+function notifyProgress({ current, total, containerCurrent, containerTotal, percentage }) {
+  chrome.runtime.sendMessage({
+    action: 'captureProgress',
+    current, total, containerCurrent, containerTotal, percentage
+  }).catch(() => {});
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }

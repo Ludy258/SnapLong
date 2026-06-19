@@ -19,115 +19,195 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
 async function handleStitch(request, sendResponse) {
   try {
-    const { frames, viewportWidth, viewportHeight, devicePixelRatio, format, cropRect,
+    const { containerStrips, primaryContainerIndex, viewportWidth, devicePixelRatio, format,
             contextFrame } = request;
 
-    if (!frames || frames.length === 0) throw new Error('No frames');
+    if (!containerStrips || containerStrips.length === 0) throw new Error('No container strips');
 
-    console.log('[Offscreen] Stitching', frames.length, 'frames, compositing:', !!contextFrame && !!cropRect);
+    console.log('[Offscreen] Stitching', containerStrips.length, 'containers, compositing:', !!contextFrame);
 
     const dpr = devicePixelRatio || 1;
+    const fullW = Math.round(viewportWidth * dpr);
 
-    // 加载容器滚动帧
-    let images = await Promise.all(frames.map(d => loadImage(d.dataUrl)));
+    // Step 1: 每个容器独立裁剪 + 拼接
+    const stitchedStrips = [];
+    let primaryStripHeight = 0;
 
-    // 裁剪容器帧（自定义滚动容器时每帧裁剪到容器区域）
-    if (cropRect) {
-      console.log('[Offscreen] Cropping to container:', cropRect);
+    for (const cs of containerStrips) {
+      if (!cs.frames || cs.frames.length === 0) continue;
+
+      // 加载本容器的帧
+      let images = await Promise.all(cs.frames.map(f => loadImage(f.dataUrl)));
+
+      // 裁剪到容器区域
+      if (cs.cropRect) {
+        for (let i = 0; i < images.length; i++) {
+          const cropped = cropToRect(images[i], cs.cropRect, dpr);
+          if (cropped) images[i] = cropped;
+        }
+      }
+
+      // 拼接本容器
+      const offsets = calculateOffsets(images, cs.frames);
+      const lastIdx = images.length - 1;
+      const stripHeight = offsets[lastIdx] + images[lastIdx].height;
+
+      // 生成 strip canvas
+      const stripCanvas = document.createElement('canvas');
+      const stripW = cs.cropRect ? Math.round(cs.cropRect.width * dpr) : fullW;
+      stripCanvas.width = stripW;
+      stripCanvas.height = stripHeight;
+      const sctx = stripCanvas.getContext('2d');
       for (let i = 0; i < images.length; i++) {
-        const cropped = cropToRect(images[i], cropRect, dpr);
-        if (cropped) images[i] = cropped;
+        sctx.drawImage(images[i], 0, offsets[i]);
+      }
+
+      // 清理
+      images.forEach(img => {
+        if (img._canvas) { img._canvas = null; img._ctx = null; img._imageData = null; img._pixels = null; }
+      });
+
+      stitchedStrips.push({
+        containerIndex: cs.containerIndex,
+        canvas: stripCanvas,
+        cropRect: cs.cropRect,
+        height: stripHeight,
+      });
+
+      if (cs.containerIndex === primaryContainerIndex) {
+        primaryStripHeight = stripHeight;
       }
     }
 
-    // 计算容器帧拼接偏移
-    const containerOffsets = calculateOffsets(images, frames);
-    const lastIdx = images.length - 1;
-    const containerTotalHeight = containerOffsets[lastIdx] + images[lastIdx].height;
+    if (stitchedStrips.length === 0) throw new Error('No valid strips');
 
+    // 用主容器高度；若无指定则用最长
+    const middleHeight = primaryStripHeight > 0
+      ? primaryStripHeight
+      : Math.max(...stitchedStrips.map(s => s.height));
+
+    // 负载上下文帧
+    let contextImg = null;
+    if (contextFrame) {
+      contextImg = await loadImage(contextFrame);
+    }
+
+    const fullH = contextImg ? (contextImg.naturalHeight || contextImg.height) : 0;
+
+    // 找到所有容器的覆盖范围
+    let minTop = Infinity, maxBottom = 0;
+    for (const s of stitchedStrips) {
+      if (s.cropRect) {
+        const t = Math.round(s.cropRect.top * dpr);
+        const b = t + Math.round(s.cropRect.height * dpr);
+        if (t < minTop) minTop = t;
+        if (b > maxBottom) maxBottom = b;
+      }
+    }
+    if (minTop === Infinity) { minTop = 0; maxBottom = fullH; }
+
+    const topHeight = minTop;
+    const bottomHeight = Math.max(0, fullH - maxBottom);
+    const totalHeight = topHeight + middleHeight + bottomHeight;
+
+    console.log('[Offscreen] Composite size:', fullW, 'x', totalHeight);
+
+    // Step 2: 合成最终画布
     let canvas;
 
-    if (contextFrame && cropRect) {
-      // ===== 合成模式：容器拼接内容嵌入到完整视口上下文帧 =====
-      const contextImg = await loadImage(contextFrame);
-
-      const fullW = Math.round(viewportWidth * dpr);
-      const fullH = Math.round(viewportHeight * dpr);
-
-      const ctxLeft   = Math.round(cropRect.left * dpr);
-      const ctxTop    = Math.round(cropRect.top * dpr);
-      const ctxW      = Math.round(cropRect.width * dpr);
-      const ctxH      = Math.round(cropRect.height * dpr);
-      const ctxRight  = ctxLeft + ctxW;
-      const ctxBottom = ctxTop + ctxH;
-
-      const topHeight    = ctxTop;
-      const middleHeight = containerTotalHeight;
-      const bottomHeight = Math.max(0, fullH - ctxBottom);
-      const totalHeight  = topHeight + middleHeight + bottomHeight;
-
-      console.log('[Offscreen] Composite:', fullW, 'x', totalHeight);
-
+    if (contextImg) {
       canvas = document.createElement('canvas');
       canvas.width = fullW;
       canvas.height = totalHeight;
       const ctx = canvas.getContext('2d');
 
-      // 1. 上部：容器上方的一切（完整视口宽度）
+      // 取样底色
+      const bgColor = sampleBgColor(contextImg, 2, minTop + 10);
+
+      // 上部：所有容器上方
       if (topHeight > 0) {
         ctx.drawImage(contextImg, 0, 0, fullW, topHeight, 0, 0, fullW, topHeight);
       }
 
-      // 2. 中部：左区域 + 容器拼接 + 右区域
-      // 取样页面底色（边缘像素）
-      const lbg = sampleBgColor(contextImg, 2, ctxTop + 10);
-      const rbg = sampleBgColor(contextImg, fullW - 3, ctxTop + 10);
+      // 中部：先画上下文帧原始内容（保留侧边栏等），再覆盖容器拼接
+      const midCtxHeight = maxBottom - minTop; // 可见容器区域高度（物理像素）
+      const midCtxSrcTop = minTop;
 
-      // 左区域 — 原始内容1:1 + 下方空白填底色
-      if (ctxLeft > 0) {
-        ctx.drawImage(contextImg, 0, ctxTop, ctxLeft, ctxH,
-                      0, topHeight, ctxLeft, ctxH);
-        if (middleHeight > ctxH) {
-          ctx.fillStyle = lbg;
-          ctx.fillRect(0, topHeight + ctxH, ctxLeft, middleHeight - ctxH);
-        }
-      }
-      // 容器拼接内容
-      for (let i = 0; i < images.length; i++) {
-        const dy = topHeight + containerOffsets[i];
-        ctx.drawImage(images[i], ctxLeft, dy);
-      }
-      // 右区域 — 原始内容1:1 + 下方空白填底色
-      if (ctxRight < fullW) {
-        const rw = fullW - ctxRight;
-        ctx.drawImage(contextImg, ctxRight, ctxTop, rw, ctxH,
-                      ctxRight, topHeight, rw, ctxH);
-        if (middleHeight > ctxH) {
-          ctx.fillStyle = rbg;
-          ctx.fillRect(ctxRight, topHeight + ctxH, rw, middleHeight - ctxH);
-        }
+      // 上下文帧原始内容（全宽，保留侧边栏、固定元素等）
+      ctx.drawImage(contextImg, 0, midCtxSrcTop, fullW, midCtxHeight,
+                    0, topHeight, fullW, midCtxHeight);
+
+      // 找出容器覆盖的左右边界
+      let coverLeft = fullW, coverRight = 0;
+      for (const s of stitchedStrips) {
+        if (!s.cropRect) continue;
+        const x = Math.round(s.cropRect.left * dpr);
+        const r = x + s.canvas.width;
+        if (x < coverLeft) coverLeft = x;
+        if (r > coverRight) coverRight = r;
       }
 
-      // 3. 下部：容器下方的一切（完整视口宽度）
+      // 容器拼接内容覆盖在上下文上方（全高）
+      for (const s of stitchedStrips) {
+        if (!s.cropRect) continue;
+        const x = Math.round(s.cropRect.left * dpr);
+        ctx.drawImage(s.canvas, 0, 0, s.canvas.width, s.height,
+                      x, topHeight, s.canvas.width, s.height);
+      }
+
+      // 超出上下文高度的区域：左右空白填底色
+      if (middleHeight > midCtxHeight) {
+        const extraTop = topHeight + midCtxHeight;
+        const extraH = middleHeight - midCtxHeight;
+        if (coverLeft > 0) {
+          ctx.fillStyle = bgColor;
+          ctx.fillRect(0, extraTop, coverLeft, extraH);
+        }
+        if (coverRight < fullW) {
+          ctx.fillStyle = bgColor;
+          ctx.fillRect(coverRight, extraTop, fullW - coverRight, extraH);
+        }
+        // 容器间间隙也填底色
+        const sorted = stitchedStrips
+          .filter(s => s.cropRect)
+          .map(s => ({ x: Math.round(s.cropRect.left * dpr), r: Math.round(s.cropRect.left * dpr) + s.canvas.width }))
+          .sort((a, b) => a.x - b.x);
+        for (let i = 1; i < sorted.length; i++) {
+          const gapStart = sorted[i - 1].r;
+          const gapEnd = sorted[i].x;
+          if (gapEnd > gapStart) {
+            ctx.fillStyle = bgColor;
+            ctx.fillRect(gapStart, extraTop, gapEnd - gapStart, extraH);
+          }
+        }
+      }
+
+      // 下部：所有容器下方
       if (bottomHeight > 0) {
-        ctx.drawImage(contextImg, 0, ctxBottom, fullW, bottomHeight,
+        ctx.drawImage(contextImg, 0, maxBottom, fullW, bottomHeight,
                       0, topHeight + middleHeight, fullW, bottomHeight);
       }
 
+    } else if (stitchedStrips.length === 1) {
+      // 单容器无合成 → 直接用 strip canvas（向后兼容）
+      canvas = stitchedStrips[0].canvas;
+
     } else {
-      // 标准/仅容器模式（无合成）
-      const imageWidth = cropRect
-        ? Math.round(cropRect.width * dpr)
-        : Math.round(viewportWidth * dpr);
-      const imageHeight = containerTotalHeight;
+      // 多容器无上下文帧 → 水平拼接
+      // 找到最大高度，各容器下方填底色
+      canvas = document.createElement('canvas');
+      canvas.width = fullW;
+      canvas.height = middleHeight;
+      const ctx = canvas.getContext('2d');
 
-      console.log('[Offscreen] Size:', imageWidth, 'x', imageHeight);
-
-      if (imageWidth > MAX_CANVAS_SIZE || imageHeight > MAX_CANVAS_SIZE ||
-          imageWidth * imageHeight > MAX_CANVAS_AREA) {
-        canvas = stitchWithSlicing(images, containerOffsets, imageWidth, imageHeight);
-      } else {
-        canvas = stitchToCanvas(images, containerOffsets, imageWidth, imageHeight);
+      for (const s of stitchedStrips) {
+        const x = s.cropRect ? Math.round(s.cropRect.left * dpr) : 0;
+        ctx.drawImage(s.canvas, x, 0);
+        if (s.height < middleHeight) {
+          const bg = sampleBgColor(s.canvas, 1, s.height - 1);
+          ctx.fillStyle = bg;
+          ctx.fillRect(x, s.height, s.canvas.width, middleHeight - s.height);
+        }
       }
     }
 
@@ -141,11 +221,6 @@ async function handleStitch(request, sendResponse) {
       const quality = format === 'jpeg' ? 0.92 : undefined;
       dataUrl = canvas.toDataURL(mimeType, quality);
     }
-
-    // 清理
-    images.forEach(img => {
-      if (img._canvas) { img._canvas = null; img._ctx = null; img._imageData = null; img._pixels = null; }
-    });
 
     console.log('[Offscreen] Output:', Math.round(dataUrl.length / 1024), 'KB');
     sendResponse({ success: true, dataUrl });

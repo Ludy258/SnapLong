@@ -28,13 +28,14 @@ document.addEventListener('DOMContentLoaded', () => {
   const container = document.querySelector('.container');
   const themeSegments = document.querySelectorAll('#themeSelect .seg-option');
   const containerSection = document.getElementById('containerSection');
-  const containerSelect = document.getElementById('containerSelect');
+  const containerCheckList = document.getElementById('containerCheckList');
   const keepHeaderFooterCheck = document.getElementById('keepHeaderFooterCheck');
 
   let isCapturing = false;
   let currentFormat = 'png';
   let currentTheme = 'auto';
-  let scrollContainerIndex = 0;
+  let selectedContainerIndices = [];
+  let primaryContainerIndex = 0;
 
   // 应用主题
   function applyTheme(mode) {
@@ -203,41 +204,122 @@ document.addEventListener('DOMContentLoaded', () => {
 
   /**
    * 更新滚动容器选择器
-   * 当页面有多个可滚动区域时显示供用户选择
+   * 当页面有多个可滚动区域时显示多选列表（复选 + 主容器单选）
    */
   function updateContainerSelector(containers) {
-    if (!containerSection || !containerSelect) return;
+    if (!containerSection || !containerCheckList) return;
 
-    // 清空并重置
-    containerSelect.innerHTML = '';
-    scrollContainerIndex = 0;
+    containerCheckList.innerHTML = '';
+    selectedContainerIndices = [];
+    primaryContainerIndex = 0;
 
-    // 只有多容器时才显示选择器
     if (!containers || containers.length <= 1) {
       containerSection.style.display = 'none';
       return;
     }
 
-    // 填充选项
+    // 默认全勾选 + 最大维度为主容器
+    let maxArea = 0;
     for (const c of containers) {
-      const opt = document.createElement('option');
-      opt.value = c.index;
+      const area = c.scrollWidth * c.scrollHeight;
+      if (area > maxArea) { maxArea = area; primaryContainerIndex = c.index; }
+    }
+    selectedContainerIndices = containers.map(c => c.index);
+
+    for (const c of containers) {
+      const row = document.createElement('div');
+      row.className = 'container-check-item';
+
+      // 主容器单选（自定义圆点）
+      const radioWrap = document.createElement('label');
+      radioWrap.className = 'cc-radio-wrap';
+      radioWrap.title = '设为主容器（决定截图总高度）';
+      const rb = document.createElement('input');
+      rb.type = 'radio';
+      rb.name = 'primaryContainer';
+      rb.value = c.index;
+      rb.checked = c.index === primaryContainerIndex;
+      rb.addEventListener('change', () => {
+        primaryContainerIndex = c.index;
+        updateContainerBadges(containers);
+        saveOptions();
+      });
+      const radioDot = document.createElement('span');
+      radioDot.className = 'cc-radio-dot';
+      radioWrap.appendChild(rb);
+      radioWrap.appendChild(radioDot);
+      row.appendChild(radioWrap);
+
+      // 名称 + 尺寸
+      const info = document.createElement('span');
+      info.className = 'cc-info';
+      const nameEl = document.createElement('span');
+      nameEl.className = 'cc-name';
+      nameEl.textContent = c.selector;
+      const sizeEl = document.createElement('span');
+      sizeEl.className = 'cc-size';
       const sizeLabel = c.scrollWidth > 9999
         ? `${(c.scrollWidth / 1000).toFixed(0)}k×${(c.scrollHeight / 1000).toFixed(0)}k`
         : `${c.scrollWidth}×${c.scrollHeight}`;
-      opt.textContent = `${c.selector} (${sizeLabel})`;
-      containerSelect.appendChild(opt);
+      sizeEl.textContent = sizeLabel;
+      info.appendChild(nameEl);
+      info.appendChild(sizeEl);
+      row.appendChild(info);
+
+      // 主容器徽章
+      const badge = document.createElement('span');
+      badge.className = 'cc-primary-badge';
+      badge.textContent = '主';
+      badge.dataset.containerIndex = c.index;
+      if (c.index === primaryContainerIndex) badge.classList.add('active');
+      row.appendChild(badge);
+
+      // 截取开关（自定义 toggle）
+      const toggleWrap = document.createElement('label');
+      toggleWrap.className = 'cc-toggle-wrap';
+      toggleWrap.title = '截取此区域';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = true;
+      cb.dataset.index = c.index;
+      cb.addEventListener('change', () => syncContainerSelection(containers));
+      const toggleTrack = document.createElement('span');
+      toggleTrack.className = 'cc-toggle-track';
+      toggleWrap.appendChild(cb);
+      toggleWrap.appendChild(toggleTrack);
+      row.appendChild(toggleWrap);
+
+      containerCheckList.appendChild(row);
     }
 
-    containerSelect.value = '0';
     containerSection.style.display = 'block';
   }
 
-  // 容器选择变更
-  if (containerSelect) {
-    containerSelect.addEventListener('change', () => {
-      scrollContainerIndex = parseInt(containerSelect.value) || 0;
+  /** 更新主容器徽章和单选状态 */
+  function updateContainerBadges(containers) {
+    const badges = containerCheckList.querySelectorAll('.cc-primary-badge');
+    badges.forEach(b => {
+      const idx = parseInt(b.dataset.containerIndex);
+      b.classList.toggle('active', idx === primaryContainerIndex);
     });
+    const rbs = containerCheckList.querySelectorAll('input[type="radio"]');
+    rbs.forEach(rb => { rb.checked = parseInt(rb.value) === primaryContainerIndex; });
+  }
+
+  /** 同步复选框勾选状态 */
+  function syncContainerSelection(containers) {
+    const checked = [];
+    const cbs = containerCheckList.querySelectorAll('input[type="checkbox"]');
+    cbs.forEach(cb => { if (cb.checked) checked.push(parseInt(cb.dataset.index)); });
+    selectedContainerIndices = checked;
+
+    // 若当前主容器被取消勾选，自动切到第一个勾选项
+    if (!selectedContainerIndices.includes(primaryContainerIndex) && selectedContainerIndices.length > 0) {
+      primaryContainerIndex = selectedContainerIndices[0];
+      updateContainerBadges(containers);
+    }
+
+    saveOptions();
   }
 
   function setBadge(text, type) {
@@ -276,7 +358,8 @@ document.addEventListener('DOMContentLoaded', () => {
         preScroll: true,
         savePath: savePathInput.value.trim() || 'SnapLong',
         saveAs: saveAsCheck.checked,
-        scrollContainerIndex: scrollContainerIndex,
+        scrollContainerIndices: selectedContainerIndices,
+        primaryContainerIndex: primaryContainerIndex,
         keepHeaderFooter: keepHeaderFooterCheck.checked
       };
 
@@ -329,7 +412,11 @@ document.addEventListener('DOMContentLoaded', () => {
     switch (msg.action) {
       case 'captureProgress':
         progressBar.style.width = `${msg.percentage}%`;
-        progressText.textContent = `正在截图 ${msg.current}/${msg.total}`;
+        if (msg.containerTotal && msg.containerTotal > 1) {
+          progressText.textContent = `容器 ${msg.containerCurrent}/${msg.containerTotal} · 帧 ${msg.current}/${msg.total}`;
+        } else {
+          progressText.textContent = `正在截图 ${msg.current}/${msg.total}`;
+        }
         progressDetail.textContent = `第 ${msg.current} 帧`;
         progressPercentage.textContent = `${msg.percentage}%`;
         break;
