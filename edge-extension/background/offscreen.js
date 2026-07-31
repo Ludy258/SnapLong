@@ -8,6 +8,15 @@
 const MAX_CANVAS_SIZE = 32767;
 const MAX_CANVAS_AREA = 268000000;
 
+function assertCanvasSize(width, height, label = 'Canvas') {
+  if (width <= 0 || height <= 0) {
+    throw new Error(`${label} size is invalid: ${width}x${height}`);
+  }
+  if (width > MAX_CANVAS_SIZE || height > MAX_CANVAS_SIZE || width * height > MAX_CANVAS_AREA) {
+    throw new Error(`${label} is too large: ${width}x${height}. Chrome canvas limit is ${MAX_CANVAS_SIZE}px per side and about ${Math.floor(MAX_CANVAS_AREA / 1000000)}MP total.`);
+  }
+}
+
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'stitch') {
     handleStitch(request, sendResponse);
@@ -53,8 +62,9 @@ async function handleStitch(request, sendResponse) {
       const stripHeight = offsets[lastIdx] + images[lastIdx].height;
 
       // 生成 strip canvas
-      const stripCanvas = document.createElement('canvas');
       const stripW = cs.cropRect ? Math.round(cs.cropRect.width * dpr) : fullW;
+      assertCanvasSize(stripW, stripHeight, `Container ${cs.containerIndex} canvas`);
+      const stripCanvas = document.createElement('canvas');
       stripCanvas.width = stripW;
       stripCanvas.height = stripHeight;
       const sctx = stripCanvas.getContext('2d');
@@ -111,6 +121,7 @@ async function handleStitch(request, sendResponse) {
     const totalHeight = topHeight + middleHeight + bottomHeight;
 
     console.log('[Offscreen] Composite size:', fullW, 'x', totalHeight);
+    assertCanvasSize(fullW, totalHeight || middleHeight, 'Final screenshot canvas');
 
     // Step 2: 合成最终画布
     let canvas;
@@ -195,6 +206,7 @@ async function handleStitch(request, sendResponse) {
     } else {
       // 多容器无上下文帧 → 水平拼接
       // 找到最大高度，各容器下方填底色
+      assertCanvasSize(fullW, middleHeight, 'Multi-container canvas');
       canvas = document.createElement('canvas');
       canvas.width = fullW;
       canvas.height = middleHeight;
@@ -214,8 +226,7 @@ async function handleStitch(request, sendResponse) {
     // 根据格式处理
     let dataUrl;
     if (format === 'pdf') {
-      const jpegDataUrl = canvas.toDataURL('image/jpeg', 0.9);
-      dataUrl = generateSimplePdf(jpegDataUrl, canvas.width, canvas.height);
+      dataUrl = generatePaginatedPdf(canvas);
     } else {
       const mimeType = format === 'jpeg' ? 'image/jpeg' : 'image/png';
       const quality = format === 'jpeg' ? 0.92 : undefined;
@@ -296,6 +307,7 @@ function getPixel(image, x, y) {
 }
 
 function stitchToCanvas(images, offsets, width, height) {
+  assertCanvasSize(width, height, 'Stitched canvas');
   const canvas = document.createElement('canvas');
   canvas.width = width; canvas.height = height;
   const ctx = canvas.getContext('2d');
@@ -331,6 +343,7 @@ function cropToRect(image, rect, dpr) {
   const srcW = Math.min(sw, Math.max(0, imgW - sx));
   const srcH = Math.min(sh, Math.max(0, imgH - sy));
   if (srcW <= 0 || srcH <= 0) return null;
+  assertCanvasSize(srcW, srcH, 'Cropped container canvas');
   const canvas = document.createElement('canvas');
   canvas.width = srcW;
   canvas.height = srcH;
@@ -361,96 +374,79 @@ console.log('[Offscreen] Ready');
 // ===================== PDF 生成 =====================
 
 /**
- * 将 JPEG 图片嵌入到最小 PDF 文件中
- * @param {string} jpegDataUrl - data:image/jpeg;base64,...
- * @param {number} imgWidth - 图片宽度（像素）
- * @param {number} imgHeight - 图片高度（像素）
+ * 将长截图按 A4 页面切片生成 PDF，避免整张图被压缩到单页。
+ * @param {HTMLCanvasElement} sourceCanvas
  * @returns {string} data:application/pdf;base64,...
  */
-function generateSimplePdf(jpegDataUrl, imgWidth, imgHeight) {
-  // 提取 JPEG 二进制数据
-  const base64 = jpegDataUrl.split(',')[1];
-  const raw = atob(base64);
-  const jpegLen = raw.length;
+function generatePaginatedPdf(sourceCanvas) {
+  const imgWidth = sourceCanvas.width;
+  const imgHeight = sourceCanvas.height;
 
-  // A4 尺寸（点）：595.28 x 841.89
-  // 图片适配页面宽度，保留边距
   const margin = 28; // ~1cm
   const pageW = 595.28;
   const pageH = 841.89;
   const maxW = pageW - margin * 2;
   const maxH = pageH - margin * 2;
-  const scale = Math.min(maxW / imgWidth, maxH / imgHeight, 1);
-  const dispW = (imgWidth * scale).toFixed(2);
-  const dispH = (imgHeight * scale).toFixed(2);
-  const x = margin.toFixed(2);
-  const y = (pageH - margin - parseFloat(dispH)).toFixed(2);
+  const scale = Math.min(maxW / imgWidth, 1);
+  const sliceHeightPx = Math.max(1, Math.floor(maxH / scale));
+  const pageCount = Math.ceil(imgHeight / sliceHeightPx);
+  const pagesObjNum = pageCount * 4 + 1;
+  const catalogObjNum = pagesObjNum + 1;
 
-  // 构建 PDF 对象
-  let objCount = 0;
   const objects = [];
+  const pageNums = [];
 
-  function obj(content) {
-    objCount++;
-    const streamStart = content.indexOf('stream\n');
-    const streamEnd = content.lastIndexOf('\nendstream');
-    let dict = content;
-    if (streamStart !== -1) {
-      dict = content.substring(0, streamStart);
-    }
-    objects.push({ num: objCount, data: content });
-    return objCount;
+  function addObject(body) {
+    const num = objects.length + 1;
+    objects.push({ num, data: `${num} 0 obj\n${body}\nendobj` });
+    return num;
   }
 
-  // Object 1: Image XObject（JPEG 流）
-  obj(`1 0 obj
-<< /Type /XObject /Subtype /Image /Width ${imgWidth} /Height ${imgHeight}
+  for (let pageIndex = 0; pageIndex < pageCount; pageIndex++) {
+    const sy = pageIndex * sliceHeightPx;
+    const sliceH = Math.min(sliceHeightPx, imgHeight - sy);
+    assertCanvasSize(imgWidth, sliceH, `PDF page ${pageIndex + 1} image`);
+
+    const slice = document.createElement('canvas');
+    slice.width = imgWidth;
+    slice.height = sliceH;
+    const ctx = slice.getContext('2d');
+    ctx.drawImage(sourceCanvas, 0, sy, imgWidth, sliceH, 0, 0, imgWidth, sliceH);
+
+    const raw = atob(slice.toDataURL('image/jpeg', 0.9).split(',')[1]);
+    const imageObj = addObject(`<< /Type /XObject /Subtype /Image /Width ${imgWidth} /Height ${sliceH}
    /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode
-   /Length ${jpegLen} >>
+   /Length ${raw.length} >>
 stream
 ${raw}
-endstream
-endobj`);
+endstream`);
 
-  // Object 2: 页面内容流（绘制图片）
-  const contentStream = `q
-${dispW} 0 0 ${dispH} ${x} ${y} cm
-/Im0 Do
-Q`;
-  obj(`2 0 obj
-<< /Length ${contentStream.length} >>
+    const dispW = (imgWidth * scale).toFixed(2);
+    const dispH = (sliceH * scale).toFixed(2);
+    const x = margin.toFixed(2);
+    const y = (pageH - margin - parseFloat(dispH)).toFixed(2);
+    const imageName = `Im${pageIndex}`;
+    const contentStream = `q\n${dispW} 0 0 ${dispH} ${x} ${y} cm\n/${imageName} Do\nQ`;
+    const contentObj = addObject(`<< /Length ${contentStream.length} >>
 stream
 ${contentStream}
-endstream
-endobj`);
+endstream`);
 
-  // Object 3: 页面资源字典
-  obj(`3 0 obj
-<< /ProcSet [/PDF /ImageC]
-   /XObject << /Im0 1 0 R >>
- >>
-endobj`);
+    const resourcesObj = addObject(`<< /ProcSet [/PDF /ImageC]
+   /XObject << /${imageName} ${imageObj} 0 R >>
+ >>`);
 
-  // Object 4: Page
-  obj(`4 0 obj
-<< /Type /Page /Parent 5 0 R
+    const pageObj = addObject(`<< /Type /Page /Parent ${pagesObjNum} 0 R
    /MediaBox [0 0 ${pageW} ${pageH}]
-   /Contents 2 0 R
-   /Resources 3 0 R
- >>
-endobj`);
+   /Contents ${contentObj} 0 R
+   /Resources ${resourcesObj} 0 R
+ >>`);
+    pageNums.push(pageObj);
+  }
 
-  // Object 5: Pages
-  obj(`5 0 obj
-<< /Type /Pages /Kids [4 0 R] /Count 1 >>
-endobj`);
+  addObject(`<< /Type /Pages /Kids [${pageNums.map(n => `${n} 0 R`).join(' ')}] /Count ${pageNums.length} >>`);
+  addObject(`<< /Type /Catalog /Pages ${pagesObjNum} 0 R >>`);
 
-  // Object 6: Catalog
-  obj(`6 0 obj
-<< /Type /Catalog /Pages 5 0 R >>
-endobj`);
-
-  // 计算每个对象的偏移
   let pdf = '%PDF-1.4\n%\xFF\xFF\xFF\xFF\n';
   const offsets = [];
   for (const ob of objects) {
@@ -458,16 +454,14 @@ endobj`);
     pdf += ob.data + '\n';
   }
 
-  // xref 表
   const xrefOffset = pdf.length;
-  pdf += `xref\n0 ${objCount + 1}\n0000000000 65535 f \n`;
+  pdf += `xref\n0 ${catalogObjNum + 1}\n0000000000 65535 f \n`;
   for (const off of offsets) {
     pdf += `${String(off).padStart(10, '0')} 00000 n \n`;
   }
 
-  // trailer
   pdf += `trailer
-<< /Size ${objCount + 1} /Root 6 0 R >>
+<< /Size ${catalogObjNum + 1} /Root ${catalogObjNum} 0 R >>
 startxref
 ${xrefOffset}
 %%EOF`;

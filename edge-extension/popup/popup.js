@@ -352,14 +352,19 @@ document.addEventListener('DOMContentLoaded', () => {
       showProgress(true);
       showMessage('⏳ 正在分析页面...', 'info');
 
+      if (containerSection && containerSection.style.display !== 'none' && selectedContainerIndices.length === 0) {
+        throw new Error('请至少选择一个滚动区域');
+      }
+
+      const hasContainerSelection = containerSection && containerSection.style.display !== 'none';
       const options = {
         format: currentFormat,
         scrollDelay: parseInt(delayInput.value),
         preScroll: true,
         savePath: savePathInput.value.trim() || 'SnapLong',
         saveAs: saveAsCheck.checked,
-        scrollContainerIndices: selectedContainerIndices,
-        primaryContainerIndex: primaryContainerIndex,
+        scrollContainerIndices: hasContainerSelection ? selectedContainerIndices : undefined,
+        primaryContainerIndex: hasContainerSelection ? primaryContainerIndex : undefined,
         keepHeaderFooter: keepHeaderFooterCheck.checked
       };
 

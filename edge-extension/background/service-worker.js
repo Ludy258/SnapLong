@@ -107,6 +107,7 @@ async function handleStartCapture(request, tabId, sendResponse) {
 
     const primaryIdx = options.primaryContainerIndex || 0;
     const hasCustomContainer = containerPlans.some(p => p.cropRect);
+    const scrollDelay = Math.max(0, Number(options.scrollDelay) || 500);
 
     // 3a. 上下文帧（完整视口，保留 fixed）
     let contextFrame = null;
@@ -140,7 +141,7 @@ async function handleStartCapture(request, tabId, sendResponse) {
         try {
           await sendMessageToTab(tabId, { action: 'scrollTo', y, containerIndex: plan.containerIndex });
         } catch (e) {}
-        await sleep(500);
+        await sleep(scrollDelay);
 
         const dataUrl = await captureVisibleTab();
         if (dataUrl) {

@@ -67,6 +67,19 @@ function detectScrollContainers() {
     }
   }
 
+  // 页面没有任何滚动区域时，仍生成一帧当前视口的截图计划。
+  if (containers.length === 0) {
+    containers.push({
+      element: se,
+      scrollHeight: Math.max(se.scrollHeight, window.innerHeight),
+      scrollWidth: Math.max(se.scrollWidth, window.innerWidth),
+      clientHeight: window.innerHeight,
+      clientWidth: window.innerWidth,
+      tagName: se.tagName.toLowerCase(),
+      selector: '页面（当前视口）',
+    });
+  }
+
   // 按 scrollHeight 降序排列
   containers.sort((a, b) => b.scrollHeight - a.scrollHeight);
   containers.forEach((c, i) => c.index = i);
@@ -352,7 +365,7 @@ async function handleStartCapture(request, sendResponse) {
 
     // 确定要截取的容器列表
     let indices;
-    if (options.scrollContainerIndices && options.scrollContainerIndices.length > 0) {
+    if (Array.isArray(options.scrollContainerIndices)) {
       indices = options.scrollContainerIndices.filter(i => scrollContainers[i]);
     } else if (options.scrollContainerIndex !== undefined && scrollContainers[options.scrollContainerIndex]) {
       // 向后兼容：单容器模式
@@ -360,6 +373,10 @@ async function handleStartCapture(request, sendResponse) {
     } else {
       // 默认：全选
       indices = scrollContainers.map((_, i) => i);
+    }
+
+    if (indices.length === 0) {
+      throw new Error('No scroll containers selected');
     }
 
     // 扫描 fixed 元素
