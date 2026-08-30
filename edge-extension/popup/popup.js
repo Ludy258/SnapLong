@@ -236,11 +236,17 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
 
-    // 默认全勾选 + 最大维度为主容器
-    let maxArea = 0;
+    // 默认全勾选；主容器决定最终截图高度，因此优先选择最长的滚动区域。
+    let maxScrollHeight = 0;
+    let maxClientWidth = 0;
     for (const c of containers) {
-      const area = c.scrollWidth * c.scrollHeight;
-      if (area > maxArea) { maxArea = area; primaryContainerIndex = c.index; }
+      const isTaller = c.scrollHeight > maxScrollHeight;
+      const hasSameHeightAndWiderViewport = c.scrollHeight === maxScrollHeight && c.clientWidth > maxClientWidth;
+      if (isTaller || hasSameHeightAndWiderViewport) {
+        maxScrollHeight = c.scrollHeight;
+        maxClientWidth = c.clientWidth;
+        primaryContainerIndex = c.index;
+      }
     }
     selectedContainerIndices = containers.map(c => c.index);
 
