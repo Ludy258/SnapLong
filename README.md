@@ -83,11 +83,15 @@ Compress-Archive -Path 'edge-extension/*' -DestinationPath 'SnapLong-extension.z
 
 项目使用 Manifest V3、负责截图协调的 Service Worker、负责图像处理的 Offscreen Document，以及原生 JavaScript。当前代码不包含统计服务或后端接口，截图数据仅在浏览器扩展中处理并下载到本地。
 
+## 回归测试
+
+可直接打开 `tests/fixtures/` 下的静态页面，验证并列、嵌套、重叠和动态布局的多区域截图行为。具体步骤和预期结果见 [tests/README.md](tests/README.md)；`node tests/verify-content-logic.mjs` 可校验核心候选筛选与布局漂移规则。
+
 ## 更新记录
 
 | 版本 | 说明 |
 |---|---|
-| 开发中 | 主容器默认改为优先选择滚动高度最大的区域，与最终合成图高度规则一致。 |
+| 开发中 | 主容器默认选择最长区域；自动排除嵌套或大面积重叠候选，并在布局漂移时安全中止截图。 |
 | **v1.3.1** | 截图稳定性优化、新的紧凑弹窗和图标、多区域控件对齐及减少动态效果支持。 |
 | v1.3.0 | 多区域截图、上下文合成和固定页眉页脚保留。 |
 | v1.2.0 | 自定义滚动容器合成模式。 |

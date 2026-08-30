@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SnapLong Fixture - Nested Panels</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; min-width: 760px; background: #edf3f4; color: #14232b; font: 14px/1.45 "Segoe UI", "Microsoft YaHei", sans-serif; }
+    header { height: 56px; padding: 17px 24px; border-bottom: 1px solid #cbd8db; background: #ffffff; font-weight: 700; }
+    #outer-panel { width: min(860px, calc(100vw - 48px)); height: calc(100vh - 104px); margin: 24px; overflow-y: auto; border: 2px solid #0f766e; background: #ffffff; }
+    .outer-row { margin: 16px; min-height: 120px; padding: 16px; border: 1px solid #d7e1e2; background: #f9fbfb; }
+    #inner-panel { height: 260px; margin: 16px; overflow-y: auto; border: 2px solid #2563eb; background: #eef5ff; }
+    .inner-row { min-height: 70px; margin: 10px; padding: 12px; border: 1px solid #bdd3fa; background: #ffffff; }
+    .note { padding: 12px 16px; color: #0f766e; font-weight: 700; }
+  </style>
+</head>
+<body>
+  <header>SnapLong fixture: nested scroll panels</header>
+  <section id="outer-panel" aria-label="Outer scroll panel">
+    <p class="note">Only this outer panel should remain as an automatic candidate.</p>
+    <script>for (let i = 1; i <= 8; i++) document.write(`<article class="outer-row">Outer item ${i}</article>`);</script>
+    <section id="inner-panel" aria-label="Nested scroll panel">
+      <script>for (let i = 1; i <= 18; i++) document.write(`<article class="inner-row">Nested item ${i}</article>`);</script>
+    </section>
+    <script>for (let i = 9; i <= 18; i++) document.write(`<article class="outer-row">Outer item ${i}</article>`);</script>
+  </section>
+</body>
+</html>

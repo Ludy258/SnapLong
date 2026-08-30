@@ -16,7 +16,8 @@ let selectedContainerIndex = 0;
 
 /**
  * 检测页面中所有可滚动的容器
- * 返回排序后的候选列表（scrollHeight 从大到小），排除狭窄元素（侧边栏）
+ * 返回彼此独立的候选列表（scrollHeight 从大到小）。页面级滚动保留，
+ * 自定义容器会排除父子嵌套和几乎完全重叠的重复候选。
  */
 function detectScrollContainers() {
   const containers = [];
@@ -27,6 +28,7 @@ function detectScrollContainers() {
   if (se.scrollHeight > se.clientHeight + 10) {
     containers.push({
       element: se,
+      isNative: true,
       scrollHeight: se.scrollHeight,
       scrollWidth: se.scrollWidth,
       clientHeight: se.clientHeight,
@@ -58,6 +60,7 @@ function detectScrollContainers() {
 
       containers.push({
         element: el,
+        isNative: false,
         scrollHeight: el.scrollHeight,
         scrollWidth: el.scrollWidth,
         clientHeight: el.clientHeight,
@@ -68,10 +71,15 @@ function detectScrollContainers() {
     }
   }
 
+  const independentContainers = filterIndependentContainers(containers);
+  containers.length = 0;
+  containers.push(...independentContainers);
+
   // 页面没有任何滚动区域时，仍生成一帧当前视口的截图计划。
   if (containers.length === 0) {
     containers.push({
       element: se,
+      isNative: true,
       scrollHeight: Math.max(se.scrollHeight, window.innerHeight),
       scrollWidth: Math.max(se.scrollWidth, window.innerWidth),
       clientHeight: window.innerHeight,
@@ -86,6 +94,125 @@ function detectScrollContainers() {
   containers.forEach((c, i) => c.index = i);
 
   return containers;
+}
+
+function getContainerCropRect(container) {
+  if (isNativeScrollContainer(container)) return null;
+  const rect = container.getBoundingClientRect();
+  return {
+    top: Math.round(rect.top),
+    left: Math.round(rect.left),
+    width: Math.round(rect.width),
+    height: Math.round(rect.height),
+  };
+}
+
+function rectArea(rect) {
+  return rect ? Math.max(0, rect.width) * Math.max(0, rect.height) : 0;
+}
+
+function rectOverlapRatio(first, second) {
+  if (!first || !second) return 0;
+  const left = Math.max(first.left, second.left);
+  const top = Math.max(first.top, second.top);
+  const right = Math.min(first.left + first.width, second.left + second.width);
+  const bottom = Math.min(first.top + first.height, second.top + second.height);
+  const intersection = Math.max(0, right - left) * Math.max(0, bottom - top);
+  const smallerArea = Math.min(rectArea(first), rectArea(second));
+  return smallerArea > 0 ? intersection / smallerArea : 0;
+}
+
+function filterIndependentContainers(containers) {
+  const nativeContainers = containers.filter(c => c.isNative);
+  const customContainers = containers
+    .filter(c => !c.isNative)
+    .map(c => ({ ...c, rect: getContainerCropRect(c.element) }))
+    .sort((a, b) => rectArea(b.rect) - rectArea(a.rect) || b.scrollHeight - a.scrollHeight);
+  const accepted = [];
+
+  for (const candidate of customContainers) {
+    const conflictsWithAccepted = accepted.some((other) => {
+      const nested = other.element.contains(candidate.element) || candidate.element.contains(other.element);
+      const mostlyOverlaps = rectOverlapRatio(other.rect, candidate.rect) >= 0.8;
+      return nested || mostlyOverlaps;
+    });
+    if (!conflictsWithAccepted) accepted.push(candidate);
+  }
+
+  return [...nativeContainers, ...accepted];
+}
+
+function createCapturePositions(scrollHeight, viewportHeight) {
+  const maxScroll = Math.max(0, scrollHeight - viewportHeight);
+  const stepHeight = Math.max(1, Math.floor(viewportHeight * 0.8));
+  const positions = [];
+  let currentY = 0;
+
+  while (currentY < maxScroll) {
+    positions.push(currentY);
+    currentY += stepHeight;
+  }
+  if (positions.length === 0 || positions[positions.length - 1] < maxScroll) {
+    positions.push(maxScroll);
+  }
+  if (positions.length >= 2 && positions[positions.length - 1] === positions[positions.length - 2]) {
+    positions.pop();
+  }
+  return positions;
+}
+
+function buildCapturePlan(containerIndex, initialPosition = {}) {
+  const candidate = scrollContainers[containerIndex];
+  if (!candidate) throw new Error(`Scroll container not found: ${containerIndex}`);
+
+  const container = candidate.element;
+  const isNative = isNativeScrollContainer(container);
+  const viewportHeight = isNative ? window.innerHeight : container.clientHeight;
+  const scrollHeight = isNative
+    ? Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)
+    : container.scrollHeight;
+
+  if (!Number.isFinite(viewportHeight) || viewportHeight <= 0 || !Number.isFinite(scrollHeight) || scrollHeight <= 0) {
+    throw new Error(`Invalid scroll container size at index ${containerIndex}`);
+  }
+
+  const cropRect = getContainerCropRect(container);
+  if (cropRect && (cropRect.width <= 0 || cropRect.height <= 0)) {
+    throw new Error(`Scroll container is not visible: ${containerIndex}`);
+  }
+
+  return {
+    containerIndex,
+    positions: createCapturePositions(scrollHeight, viewportHeight),
+    viewportWidth: window.innerWidth,
+    viewportHeight,
+    devicePixelRatio: window.devicePixelRatio || 1,
+    scalarHeight: scrollHeight,
+    initialScrollX: Number.isFinite(initialPosition.initialScrollX)
+      ? initialPosition.initialScrollX
+      : getScrollLeft(container),
+    initialScrollY: Number.isFinite(initialPosition.initialScrollY)
+      ? initialPosition.initialScrollY
+      : getScrollTop(container),
+    isNative,
+    cropRect,
+  };
+}
+
+function cropRectsMatch(first, second, tolerance = 2) {
+  if (!first || !second) return first === second;
+  return Math.abs(first.top - second.top) <= tolerance &&
+    Math.abs(first.left - second.left) <= tolerance &&
+    Math.abs(first.width - second.width) <= tolerance &&
+    Math.abs(first.height - second.height) <= tolerance;
+}
+
+function capturePlanLayoutChanged(previousPlan, nextPlan) {
+  if (!previousPlan) return false;
+  return !cropRectsMatch(previousPlan.cropRect, nextPlan.cropRect) ||
+    Math.abs(Number(previousPlan.viewportHeight) - nextPlan.viewportHeight) > 2 ||
+    Math.abs(Number(previousPlan.scalarHeight) - nextPlan.scalarHeight) > 2 ||
+    Math.abs(Number(previousPlan.viewportWidth) - nextPlan.viewportWidth) > 2;
 }
 
 /**
@@ -312,7 +439,10 @@ function scrollToPosition(y, x) {
     // 等待两次 requestAnimationFrame 确保渲染完成
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
-        resolve(getScrollTop(container));
+        resolve({
+          y: getScrollTop(container),
+          cropRect: getContainerCropRect(container),
+        });
       });
     });
   });
@@ -342,6 +472,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
     case 'scrollTo':
       handleScrollTo(request, sendResponse);
+      return true;
+
+    case 'refreshCapturePlan':
+      handleRefreshCapturePlan(request, sendResponse);
       return true;
 
     case 'hideFixed':
@@ -440,68 +574,11 @@ async function handleStartCapture(request, sendResponse) {
       }
     }
 
-    // 为每个容器生成独立的 capture plan
-    const containerPlans = [];
-
-    for (const idx of indices) {
-      selectedContainerIndex = idx;
-      const c = scrollContainers[idx];
-      if (!c) continue;
-
-      const isNative = c.element === window || c.element === document.documentElement || c.element === document.body;
-
-      // 容器尺寸
-      const viewH = isNative ? window.innerHeight : c.element.clientHeight;
-      const scrollH = isNative
-        ? Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)
-        : c.element.scrollHeight;
-      if (!Number.isFinite(viewH) || viewH <= 0 || !Number.isFinite(scrollH) || scrollH <= 0) {
-        throw new Error(`Invalid scroll container size at index ${idx}`);
-      }
-      const maxScroll = Math.max(0, scrollH - viewH);
-
-      // 步进
-      const stepHeight = Math.max(1, Math.floor(viewH * 0.8));
-
-      // 滚动位置列表
-      const positions = [];
-      let currentY = 0;
-      while (currentY < maxScroll) {
-        positions.push(currentY);
-        currentY += stepHeight;
-      }
-      if (positions.length === 0 || positions[positions.length - 1] < maxScroll) {
-        positions.push(maxScroll);
-      }
-      if (positions.length >= 2 && positions[positions.length - 1] === positions[positions.length - 2]) {
-        positions.pop();
-      }
-
-      // 裁剪区域
-      let cropRect = null;
-      if (!isNative) {
-        const r = c.element.getBoundingClientRect();
-        cropRect = {
-          top: Math.round(r.top),
-          left: Math.round(r.left),
-          width: Math.round(r.width),
-          height: Math.round(r.height),
-        };
-      }
-
-      containerPlans.push({
-        containerIndex: idx,
-        positions,
-        viewportWidth: window.innerWidth,
-        viewportHeight: viewH,
-        devicePixelRatio: window.devicePixelRatio || 1,
-        scalarHeight: scrollH,
-        initialScrollX: initialScrollPositions.get(idx)?.x || 0,
-        initialScrollY: initialScrollPositions.get(idx)?.y || 0,
-        isNative,
-        cropRect,
-      });
-    }
+    // 为每个容器生成独立的 capture plan。
+    const containerPlans = indices.map(idx => buildCapturePlan(idx, {
+      initialScrollX: initialScrollPositions.get(idx)?.x || 0,
+      initialScrollY: initialScrollPositions.get(idx)?.y || 0,
+    }));
 
     // 恢复默认选中
     selectedContainerIndex = indices[0] ?? 0;
@@ -533,19 +610,33 @@ async function handleScrollTo(request, sendResponse) {
       throw new Error('Scroll container not found');
     }
 
-    let actualY;
+    let result;
     if (request.containerIndex !== undefined) {
       const prev = selectedContainerIndex;
       selectedContainerIndex = request.containerIndex;
       try {
-        actualY = await scrollToPosition(request.y, request.x);
+        result = await scrollToPosition(request.y, request.x);
       } finally {
         selectedContainerIndex = prev;
       }
     } else {
-      actualY = await scrollToPosition(request.y, request.x);
+      result = await scrollToPosition(request.y, request.x);
     }
-    sendResponse({ success: true, y: actualY });
+    sendResponse({ success: true, y: result.y, cropRect: result.cropRect });
+  } catch (error) {
+    sendResponse({ success: false, error: error.message });
+  }
+}
+
+function handleRefreshCapturePlan(request, sendResponse) {
+  try {
+    const previousPlan = request.previousPlan || {};
+    const plan = buildCapturePlan(request.containerIndex, previousPlan);
+    sendResponse({
+      success: true,
+      changed: capturePlanLayoutChanged(previousPlan, plan),
+      plan,
+    });
   } catch (error) {
     sendResponse({ success: false, error: error.message });
   }

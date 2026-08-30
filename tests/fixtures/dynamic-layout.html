@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SnapLong Fixture - Dynamic Layout</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; min-width: 860px; background: #edf3f4; color: #14232b; font: 14px/1.45 "Segoe UI", "Microsoft YaHei", sans-serif; }
+    header { display: flex; align-items: center; justify-content: space-between; height: 64px; padding: 0 24px; border-bottom: 1px solid #cbd8db; background: #ffffff; }
+    button { min-height: 32px; border: 1px solid #0f766e; border-radius: 5px; background: #0f766e; color: #ffffff; cursor: pointer; font: inherit; font-weight: 700; }
+    #status { color: #5d7078; font-size: 12px; }
+    main { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; height: calc(100vh - 64px); padding: 16px; transition: grid-template-columns 220ms ease; }
+    .scroll-panel { min-width: 0; overflow-y: auto; border: 1px solid #9bb5b9; background: #ffffff; transition: transform 220ms ease, margin-top 220ms ease; }
+    .panel-title { position: sticky; top: 0; padding: 12px 16px; border-bottom: 1px solid #d7e1e2; background: #e0f2ef; color: #0f766e; font-weight: 700; }
+    .row { margin: 10px 16px; min-height: 88px; padding: 14px; border: 1px solid #d7e1e2; background: #f9fbfb; }
+    main.shifted { grid-template-columns: 0.78fr 1.22fr; }
+    main.shifted #right-panel { margin-top: 54px; transform: translateX(-18px); }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>SnapLong fixture: dynamic layout guard</strong>
+    <div><span id="status">No layout change scheduled.</span> <button id="shift">Move the right panel in 2 seconds</button></div>
+  </header>
+  <main id="workspace">
+    <section id="left-panel" class="scroll-panel" aria-label="Left scroll panel">
+      <div class="panel-title">Left panel</div>
+      <script>for (let i = 1; i <= 24; i++) document.write(`<article class="row">Left panel item ${i}</article>`);</script>
+    </section>
+    <section id="right-panel" class="scroll-panel" aria-label="Right scroll panel">
+      <div class="panel-title">Right panel</div>
+      <script>for (let i = 1; i <= 24; i++) document.write(`<article class="row">Right panel item ${i}</article>`);</script>
+    </section>
+  </main>
+  <script>
+    document.getElementById('shift').addEventListener('click', () => {
+      const status = document.getElementById('status');
+      status.textContent = 'The right panel will move in 2 seconds.';
+      setTimeout(() => {
+        document.getElementById('workspace').classList.toggle('shifted');
+        status.textContent = 'Layout changed. SnapLong should stop the active capture safely.';
+      }, 2000);
+    });
+  </script>
+</body>
+</html>

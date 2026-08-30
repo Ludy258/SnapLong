@@ -105,8 +105,12 @@ async function handleStartCapture(request, tabId, sendResponse) {
     capturePlan = await sendMessageToTab(tabId, { action: 'startCapture', options });
     if (!capturePlan?.success) throw new Error('Prepare capture failed: ' + (capturePlan?.error || 'no response'));
 
-    const containerPlans = capturePlan.containerPlans || [];
+    let containerPlans = capturePlan.containerPlans || [];
     if (containerPlans.length === 0) throw new Error('No containers to capture');
+
+    // 懒加载可能在生成初始计划后改变面板位置或高度；正式截图前刷新一次全部计划。
+    containerPlans = await Promise.all(containerPlans.map(plan => refreshCapturePlan(tabId, plan)));
+    capturePlan.containerPlans = containerPlans;
 
     captureState.pageInfo = pageInfo;
     captureState.capturePlan = capturePlan;
@@ -139,12 +143,22 @@ async function handleStartCapture(request, tabId, sendResponse) {
     let globalFrameIdx = 0;
 
     // 计算总帧数（用于进度）
-    const totalFrames = containerPlans.reduce((sum, p) => sum + p.positions.length, 0);
+    let totalFrames = containerPlans.reduce((sum, p) => sum + p.positions.length, 0);
 
     for (let ci = 0; ci < containerPlans.length; ci++) {
       if (!captureState.isCapturing) break;
 
-      const plan = containerPlans[ci];
+      let plan = containerPlans[ci];
+      const refreshedPlan = await refreshCapturePlan(tabId, plan, { reportChange: true });
+      if (refreshedPlan.layoutChanged) {
+        if (contextFrame) {
+          throw new Error('页面布局在截图过程中发生变化，请重新截图');
+        }
+        totalFrames += refreshedPlan.positions.length - plan.positions.length;
+        plan = refreshedPlan;
+        containerPlans[ci] = plan;
+        capturePlan.containerPlans = containerPlans;
+      }
       const frames = [];
 
       for (let fi = 0; fi < plan.positions.length; fi++) {
@@ -157,7 +171,15 @@ async function handleStartCapture(request, tabId, sendResponse) {
         if (!scrollResult?.success) {
           throw new Error(scrollResult?.error || `Scroll failed at ${y}px`);
         }
+        if (!cropRectsMatch(plan.cropRect, scrollResult.cropRect)) {
+          throw new Error('截图过程中滚动区域位置发生变化，请重新截图');
+        }
         await sleep(scrollDelay);
+
+        const livePlan = await refreshCapturePlan(tabId, plan, { reportChange: true });
+        if (livePlan.layoutChanged) {
+          throw new Error('截图过程中页面布局发生变化，请重新截图');
+        }
 
         const dataUrl = await captureVisibleTab(captureWindowId, tabId);
         const actualY = Number.isFinite(scrollResult.y) ? scrollResult.y : y;
@@ -282,6 +304,32 @@ async function getPageInfoFromTab(tabId) {
     files: ['content/content.js']
   });
   return sendMessageToTab(tabId, { action: 'getPageInfo' });
+}
+
+async function refreshCapturePlan(tabId, plan, { reportChange = false } = {}) {
+  const response = await sendMessageToTab(tabId, {
+    action: 'refreshCapturePlan',
+    containerIndex: plan.containerIndex,
+    previousPlan: plan,
+  });
+  if (!response?.success || !response.plan) {
+    throw new Error(response?.error || `Unable to refresh capture plan for container ${plan.containerIndex}`);
+  }
+
+  const nextPlan = response.plan;
+  nextPlan.layoutChanged = reportChange && response.changed === true;
+  if (nextPlan.layoutChanged) {
+    console.warn(`[SnapLong] Layout changed for container ${plan.containerIndex}; refreshing its capture plan.`);
+  }
+  return nextPlan;
+}
+
+function cropRectsMatch(first, second, tolerance = 2) {
+  if (!first || !second) return first === second;
+  return Math.abs(first.top - second.top) <= tolerance &&
+    Math.abs(first.left - second.left) <= tolerance &&
+    Math.abs(first.width - second.width) <= tolerance &&
+    Math.abs(first.height - second.height) <= tolerance;
 }
 
 async function captureVisibleTab(windowId, tabId) {
