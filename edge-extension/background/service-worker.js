@@ -11,6 +11,10 @@ let captureState = {
   pageInfo: null, capturePlan: null,
 };
 
+const CAPTURE_INTERVAL_MS = 500;
+const MAX_SCROLL_DELAY_MS = 1500;
+let lastCaptureAt = 0;
+
 // ===================== 消息处理 =====================
 
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
@@ -41,14 +45,6 @@ chrome.commands.onCommand.addListener(async (command) => {
     try {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       if (!tab || !tab.id) return;
-
-      // 注入 content script（如果尚未注入）
-      try {
-        await chrome.scripting.executeScript({
-          target: { tabId: tab.id },
-          files: ['content/content.js']
-        });
-      } catch (e) {}
 
       // 读取保存的设置，直接启动截图（避免自消息不可靠）
       const saved = await chrome.storage.local.get({
@@ -86,39 +82,56 @@ async function handleStartCapture(request, tabId, sendResponse) {
   if (captureState.isCapturing) { sendResponse({ success: false, error: 'Already capturing' }); return; }
 
   const options = request.options || {};
+  let capturePlan = null;
+  let fixedHidden = false;
+  let pageStateRestored = false;
+
+  captureState.isCapturing = true;
+  captureState.tabId = tabId;
+  captureState.options = options;
 
   try {
+    const targetTab = await chrome.tabs.get(tabId);
+    if (!targetTab?.active) {
+      throw new Error('请保持目标页面处于当前活动标签页');
+    }
+    const captureWindowId = targetTab.windowId;
+
     // 1. 获取页面信息
-    const pageInfo = await sendMessageToTab(tabId, { action: 'getPageInfo' });
+    const pageInfo = await getPageInfoFromTab(tabId);
     if (!pageInfo?.success) throw new Error('Get page info failed: ' + (pageInfo?.error || 'no response'));
 
     // 2. 准备截图（返回 containerPlans[]）
-    const capturePlan = await sendMessageToTab(tabId, { action: 'startCapture', options });
+    capturePlan = await sendMessageToTab(tabId, { action: 'startCapture', options });
     if (!capturePlan?.success) throw new Error('Prepare capture failed: ' + (capturePlan?.error || 'no response'));
 
     const containerPlans = capturePlan.containerPlans || [];
     if (containerPlans.length === 0) throw new Error('No containers to capture');
 
-    captureState.isCapturing = true;
-    captureState.tabId = tabId;
-    captureState.options = options;
     captureState.pageInfo = pageInfo;
     captureState.capturePlan = capturePlan;
 
-    const primaryIdx = options.primaryContainerIndex || 0;
+    const primaryIdx = Number.isInteger(options.primaryContainerIndex)
+      ? options.primaryContainerIndex
+      : 0;
     const hasCustomContainer = containerPlans.some(p => p.cropRect);
-    const scrollDelay = Math.max(0, Number(options.scrollDelay) || 500);
+    const shouldHideFixed = capturePlan.fixedElementCount > 0 &&
+      containerPlans.some(p => p.positions.length > 1);
+    const requestedDelay = Number(options.scrollDelay);
+    const scrollDelay = Number.isFinite(requestedDelay)
+      ? Math.min(MAX_SCROLL_DELAY_MS, Math.max(CAPTURE_INTERVAL_MS, requestedDelay))
+      : CAPTURE_INTERVAL_MS;
 
     // 3a. 上下文帧（完整视口，保留 fixed）
     let contextFrame = null;
     if (options.keepHeaderFooter && hasCustomContainer) {
-      const dataUrl = await captureVisibleTab();
-      if (dataUrl) contextFrame = dataUrl;
+      contextFrame = await captureVisibleTab(captureWindowId, tabId);
     }
 
     // 3b. 隐藏 fixed 元素
-    if (capturePlan.fixedElementCount > 0) {
-      try { await sendMessageToTab(tabId, { action: 'hideFixed' }); } catch (e) {}
+    if (shouldHideFixed) {
+      await sendMessageToTab(tabId, { action: 'hideFixed' });
+      fixedHidden = true;
     }
 
     // 4. 为每个容器独立滚动截图
@@ -138,18 +151,20 @@ async function handleStartCapture(request, tabId, sendResponse) {
         if (!captureState.isCapturing) break;
 
         const y = plan.positions[fi];
-        try {
-          await sendMessageToTab(tabId, { action: 'scrollTo', y, containerIndex: plan.containerIndex });
-        } catch (e) {}
+        const scrollResult = await sendMessageToTab(tabId, {
+          action: 'scrollTo', y, containerIndex: plan.containerIndex
+        });
+        if (!scrollResult?.success) {
+          throw new Error(scrollResult?.error || `Scroll failed at ${y}px`);
+        }
         await sleep(scrollDelay);
 
-        const dataUrl = await captureVisibleTab();
-        if (dataUrl) {
-          frames.push({
-            dataUrl,
-            y: Math.round(y * (plan.devicePixelRatio || 1)),
-          });
-        }
+        const dataUrl = await captureVisibleTab(captureWindowId, tabId);
+        const actualY = Number.isFinite(scrollResult.y) ? scrollResult.y : y;
+        frames.push({
+          dataUrl,
+          y: Math.round(actualY * (plan.devicePixelRatio || 1)),
+        });
         globalFrameIdx++;
         notifyProgress({
           current: fi + 1,
@@ -170,11 +185,9 @@ async function handleStartCapture(request, tabId, sendResponse) {
       }
     }
 
-    // 5. 恢复 fixed + 滚回顶部
-    try {
-      if (capturePlan.fixedElementCount > 0) await sendMessageToTab(tabId, { action: 'restoreFixed' });
-      await sendMessageToTab(tabId, { action: 'scrollTo', y: 0 });
-    } catch (e) {}
+    // 5. 恢复 fixed + 用户开始截图前的滚动位置
+    await restorePageState(tabId, capturePlan, fixedHidden);
+    pageStateRestored = true;
 
     if (containerStrips.length === 0) throw new Error('No frames captured');
 
@@ -208,25 +221,19 @@ async function handleStartCapture(request, tabId, sendResponse) {
 
     console.log('[SnapLong] Downloading:', filename, 'size:', Math.round(dataUrl.length / 1024), 'KB');
 
-    chrome.downloads.download({
-      url: dataUrl,
-      filename,
-      saveAs: saveOptions.saveAs,
-    }, (downloadId) => {
-      if (chrome.runtime.lastError) {
-        console.error('[SnapLong] Download error:', chrome.runtime.lastError.message);
-      } else {
-        console.log('[SnapLong] Download started, id:', downloadId);
-      }
-    });
+    const downloadId = await downloadDataUrl(dataUrl, filename, saveOptions.saveAs);
+    console.log('[SnapLong] Download started, id:', downloadId);
 
-    cleanup();
-    sendResponse({ success: true, totalFrames: globalFrameIdx });
+    sendResponse({ success: true, totalFrames: globalFrameIdx, totalCaptures: globalFrameIdx });
 
   } catch (error) {
     console.error('[SnapLong] Error:', error);
-    cleanup();
     sendResponse({ success: false, error: error.message });
+  } finally {
+    if (!pageStateRestored && capturePlan) {
+      await restorePageState(tabId, capturePlan, fixedHidden);
+    }
+    cleanup();
   }
 }
 
@@ -262,11 +269,95 @@ function sendMessageToTab(tabId, message) {
   });
 }
 
-function captureVisibleTab() {
-  return new Promise((resolve) => {
-    chrome.tabs.captureVisibleTab(null, { format: 'png' }, (dataUrl) => {
-      if (chrome.runtime.lastError) { console.error('[SnapLong] captureVisibleTab error:', chrome.runtime.lastError.message); resolve(null); }
-      else { resolve(dataUrl); }
+async function getPageInfoFromTab(tabId) {
+  try {
+    const response = await sendMessageToTab(tabId, { action: 'getPageInfo' });
+    if (response) return response;
+  } catch (error) {
+    console.warn('[SnapLong] Content script not ready, injecting it:', error.message);
+  }
+
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files: ['content/content.js']
+  });
+  return sendMessageToTab(tabId, { action: 'getPageInfo' });
+}
+
+async function captureVisibleTab(windowId, tabId) {
+  let lastError = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const wait = Math.max(0, CAPTURE_INTERVAL_MS - (Date.now() - lastCaptureAt));
+    if (wait > 0) await sleep(wait);
+
+    try {
+      const activeTab = await chrome.tabs.get(tabId);
+      if (!activeTab?.active || activeTab.windowId !== windowId) {
+        throw new Error('截图过程中请保持目标页面为当前活动标签页');
+      }
+      const dataUrl = await captureVisibleTabOnce(windowId);
+      if (!dataUrl) throw new Error('captureVisibleTab returned no image');
+      return dataUrl;
+    } catch (error) {
+      lastError = error;
+      console.warn(`[SnapLong] captureVisibleTab attempt ${attempt + 1} failed:`, error.message);
+      await sleep(CAPTURE_INTERVAL_MS);
+    }
+  }
+  throw lastError || new Error('captureVisibleTab failed');
+}
+
+function captureVisibleTabOnce(windowId) {
+  return new Promise((resolve, reject) => {
+    chrome.tabs.captureVisibleTab(windowId, { format: 'png' }, (dataUrl) => {
+      lastCaptureAt = Date.now();
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+      } else {
+        resolve(dataUrl);
+      }
+    });
+  });
+}
+
+async function restorePageState(tabId, capturePlan, fixedHidden) {
+  if (!capturePlan) return;
+
+  if (fixedHidden || capturePlan.fixedElementCount > 0) {
+    try {
+      await sendMessageToTab(tabId, { action: 'restoreFixed' });
+    } catch (error) {
+      console.warn('[SnapLong] Failed to restore fixed elements:', error.message);
+    }
+  }
+
+  const restored = new Set();
+  for (const plan of capturePlan.containerPlans || []) {
+    if (restored.has(plan.containerIndex)) continue;
+    restored.add(plan.containerIndex);
+    try {
+      await sendMessageToTab(tabId, {
+        action: 'scrollTo',
+        y: Number.isFinite(plan.initialScrollY) ? plan.initialScrollY : 0,
+        x: Number.isFinite(plan.initialScrollX) ? plan.initialScrollX : 0,
+        containerIndex: plan.containerIndex,
+      });
+    } catch (error) {
+      console.warn('[SnapLong] Failed to restore scroll position:', error.message);
+    }
+  }
+}
+
+function downloadDataUrl(url, filename, saveAs) {
+  return new Promise((resolve, reject) => {
+    chrome.downloads.download({ url, filename, saveAs }, (downloadId) => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+      } else if (!Number.isInteger(downloadId)) {
+        reject(new Error('Download did not start'));
+      } else {
+        resolve(downloadId);
+      }
     });
   });
 }
@@ -277,7 +368,11 @@ function generateFilename(title, format, saveOptions) {
   const ts = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
   const basename = `${sanitized || 'screenshot'}_${ts}.${ext}`;
   if (saveOptions?.subfolder) {
-    const folder = saveOptions.subfolder.replace(/[<>:"\\|?*]/g, '_').trim();
+    const folder = saveOptions.subfolder
+      .replace(/[<>:"/\\|?*]/g, '_')
+      .replace(/\.\.+/g, '_')
+      .replace(/[\u0000-\u001f]/g, '_')
+      .trim();
     return folder ? `${folder}/${basename}` : basename;
   }
   return basename;

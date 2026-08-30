@@ -36,6 +36,11 @@ document.addEventListener('DOMContentLoaded', () => {
   let currentTheme = 'auto';
   let selectedContainerIndices = [];
   let primaryContainerIndex = 0;
+  const MIN_SCROLL_DELAY = 500;
+  const MAX_SCROLL_DELAY = 1500;
+
+  btnCapture.disabled = true;
+  btnViewport.disabled = true;
 
   // 应用主题
   function applyTheme(mode) {
@@ -60,8 +65,9 @@ document.addEventListener('DOMContentLoaded', () => {
   }, (saved) => {
     if (saved.savePath) savePathInput.value = saved.savePath;
     saveAsCheck.checked = saved.saveAs;
-    delayInput.value = saved.scrollDelay;
-    delayValue.textContent = `${saved.scrollDelay}ms`;
+    const delay = normalizeScrollDelay(saved.scrollDelay);
+    delayInput.value = delay;
+    delayValue.textContent = `${delay}ms`;
 
     // 恢复格式选中状态
     setFormat(saved.format);
@@ -105,7 +111,7 @@ document.addEventListener('DOMContentLoaded', () => {
       savePath: savePathInput.value.trim(),
       saveAs: saveAsCheck.checked,
       format: currentFormat,
-      scrollDelay: parseInt(delayInput.value) || 500,
+      scrollDelay: normalizeScrollDelay(delayInput.value),
       theme: currentTheme,
       keepHeaderFooter: keepHeaderFooterCheck.checked
     });
@@ -125,7 +131,9 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   });
   delayInput.addEventListener('input', () => {
-    delayValue.textContent = `${delayInput.value}ms`;
+    const delay = normalizeScrollDelay(delayInput.value);
+    delayInput.value = delay;
+    delayValue.textContent = `${delay}ms`;
     saveOptions();
   });
 
@@ -175,16 +183,8 @@ document.addEventListener('DOMContentLoaded', () => {
         return;
       }
 
-      // 注入 content script
-      try {
-        await chrome.scripting.executeScript({
-          target: { tabId: tab.id },
-          files: ['content/content.js']
-        });
-      } catch (e) {}
-
       // 获取页面信息
-      const resp = await chrome.tabs.sendMessage(tab.id, { action: 'getPageInfo' });
+      const resp = await getPageInfo(tab.id);
 
       if (resp?.success) {
         const d = resp.dimensions;
@@ -200,6 +200,27 @@ document.addEventListener('DOMContentLoaded', () => {
       setBadge('连接失败', 'error');
       console.error(e);
     }
+  }
+
+  async function getPageInfo(tabId) {
+    try {
+      const response = await chrome.tabs.sendMessage(tabId, { action: 'getPageInfo' });
+      if (response) return response;
+    } catch (error) {
+      console.warn('Content script not ready, injecting it:', error);
+    }
+
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['content/content.js']
+    });
+    return chrome.tabs.sendMessage(tabId, { action: 'getPageInfo' });
+  }
+
+  function normalizeScrollDelay(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return MIN_SCROLL_DELAY;
+    return Math.min(MAX_SCROLL_DELAY, Math.max(MIN_SCROLL_DELAY, Math.round(numeric / 50) * 50));
   }
 
   /**
@@ -241,8 +262,12 @@ document.addEventListener('DOMContentLoaded', () => {
       rb.checked = c.index === primaryContainerIndex;
       rb.addEventListener('change', () => {
         primaryContainerIndex = c.index;
+        const checkbox = containerCheckList.querySelector(
+          `input[type="checkbox"][data-index="${c.index}"]`
+        );
+        if (checkbox && !checkbox.checked) checkbox.checked = true;
         updateContainerBadges(containers);
-        saveOptions();
+        syncContainerSelection(containers);
       });
       const radioDot = document.createElement('span');
       radioDot.className = 'cc-radio-dot';
@@ -343,12 +368,14 @@ document.addEventListener('DOMContentLoaded', () => {
   btnViewport.addEventListener('click', () => { if (!isCapturing) captureViewport(); });
 
   async function startCapture() {
+    if (isCapturing) return;
+    isCapturing = true;
+    btnCapture.disabled = btnViewport.disabled = true;
+
     try {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       if (!tab) throw new Error('没有找到活动标签页');
 
-      isCapturing = true;
-      btnCapture.disabled = btnViewport.disabled = true;
       showProgress(true);
       showMessage('⏳ 正在分析页面...', 'info');
 
@@ -359,7 +386,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const hasContainerSelection = containerSection && containerSection.style.display !== 'none';
       const options = {
         format: currentFormat,
-        scrollDelay: parseInt(delayInput.value),
+        scrollDelay: normalizeScrollDelay(delayInput.value),
         preScroll: true,
         savePath: savePathInput.value.trim() || 'SnapLong',
         saveAs: saveAsCheck.checked,
@@ -379,7 +406,8 @@ document.addEventListener('DOMContentLoaded', () => {
         const where = options.saveAs
           ? '请在对话框中选择保存位置'
           : `已保存到 ~/Downloads/${options.savePath}/`;
-        showMessage(`✅ 截图完成！${response.totalCaptures} 帧 → ${ext}  ${where}`, 'success');
+        const captureCount = response.totalCaptures ?? response.totalFrames ?? 0;
+        showMessage(`✅ 截图完成！${captureCount} 帧 → ${ext}  ${where}`, 'success');
       } else {
         throw new Error(response?.error || '截图失败');
       }
@@ -393,6 +421,10 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   async function captureViewport() {
+    if (isCapturing) return;
+    isCapturing = true;
+    btnCapture.disabled = btnViewport.disabled = true;
+
     try {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       if (!tab) throw new Error('没有找到活动标签页');
@@ -400,14 +432,23 @@ document.addEventListener('DOMContentLoaded', () => {
       const dataUrl = await chrome.tabs.captureVisibleTab(null, { format: 'png' });
       const ts = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
 
-      chrome.downloads.download({
-        url: dataUrl,
-        filename: `screenshot_${ts}.png`,
+      await new Promise((resolve, reject) => {
+        chrome.downloads.download({
+          url: dataUrl,
+          filename: `screenshot_${ts}.png`,
+        }, (downloadId) => {
+          if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+          else if (!Number.isInteger(downloadId)) reject(new Error('下载未启动'));
+          else resolve(downloadId);
+        });
       });
 
       showMessage('✅ 截图已保存', 'success');
     } catch (e) {
       showMessage(`❌ ${e.message}`, 'error');
+    } finally {
+      isCapturing = false;
+      btnCapture.disabled = btnViewport.disabled = false;
     }
   }
 

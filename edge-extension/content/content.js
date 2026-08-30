@@ -39,9 +39,10 @@ function detectScrollContainers() {
   // 查找自定义滚动容器（overflow-y: auto/scroll）
   const allEls = document.querySelectorAll('*');
   for (const el of allEls) {
+    if (el === se || el === document.documentElement || el === document.body) continue;
     const style = window.getComputedStyle(el);
     const oy = style.overflowY;
-    if ((oy === 'auto' || oy === 'scroll') &&
+    if ((oy === 'auto' || oy === 'scroll' || oy === 'overlay') &&
         el.scrollHeight > el.clientHeight + 5 &&
         el.offsetWidth > 0 && el.offsetHeight > 0) {
       // 跳过窄元素（很可能是侧边栏）
@@ -94,6 +95,48 @@ function getScrollContainer() {
   if (scrollContainers.length === 0) return window;
   const c = scrollContainers[selectedContainerIndex];
   return c ? c.element : window;
+}
+
+function isNativeScrollContainer(container) {
+  return container === window || container === document.scrollingElement ||
+    container === document.documentElement || container === document.body;
+}
+
+function getScrollTop(container) {
+  return isNativeScrollContainer(container)
+    ? (window.scrollY || document.documentElement.scrollTop || document.body?.scrollTop || 0)
+    : container.scrollTop;
+}
+
+function getScrollLeft(container) {
+  return isNativeScrollContainer(container)
+    ? (window.scrollX || document.documentElement.scrollLeft || document.body?.scrollLeft || 0)
+    : container.scrollLeft;
+}
+
+function setScrollTop(container, y, x) {
+  const targetY = Number.isFinite(Number(y)) ? Math.max(0, Number(y)) : 0;
+  const targetX = Number.isFinite(Number(x)) ? Math.max(0, Number(x)) : getScrollLeft(container);
+  const isNative = isNativeScrollContainer(container);
+  const scrollElement = isNative ? document.scrollingElement : container;
+  const previousBehavior = scrollElement?.style.scrollBehavior;
+
+  // 页面自身可能设置了 smooth scrolling；截图必须等到目标位置稳定后再执行。
+  if (scrollElement) scrollElement.style.scrollBehavior = 'auto';
+  try {
+    if (isNative) window.scrollTo(targetX, targetY);
+    else {
+      if (x !== undefined) container.scrollLeft = targetX;
+      container.scrollTop = targetY;
+    }
+  } finally {
+    if (scrollElement) scrollElement.style.scrollBehavior = previousBehavior;
+  }
+}
+
+function dispatchScrollEvent(container) {
+  const target = isNativeScrollContainer(container) ? document : container;
+  target.dispatchEvent(new Event('scroll'));
 }
 
 /**
@@ -182,15 +225,13 @@ function restoreFixedElements() {
  */
 async function preScrollForLazyLoad() {
   const { scrollHeight, viewportHeight } = getPageDimensions();
-  const totalScroll = scrollHeight - viewportHeight;
-  const step = viewportHeight;
+  const totalScroll = Math.max(0, scrollHeight - viewportHeight);
+  const step = Math.max(1, viewportHeight);
 
   const container = getScrollContainer();
-  const isNative = container === window || container === document.documentElement || container === document.body;
 
   function doScroll(y) {
-    if (isNative) window.scrollTo(0, y);
-    else container.scrollTop = y;
+    setScrollTop(container, y);
   }
 
   // 向下快速滚动
@@ -199,7 +240,7 @@ async function preScrollForLazyLoad() {
     currentScroll = Math.min(currentScroll + step, totalScroll);
     doScroll(currentScroll);
     // 触发 IntersectionObserver 等懒加载机制
-    document.dispatchEvent(new Event('scroll'));
+    dispatchScrollEvent(container);
     // 小延迟让懒加载触发
     await sleep(30);
   }
@@ -212,7 +253,7 @@ async function preScrollForLazyLoad() {
 
   // 滚回顶部
   doScroll(0);
-  document.dispatchEvent(new Event('scroll'));
+  dispatchScrollEvent(container);
 
   // 等待顶部内容稳定
   await sleep(200);
@@ -261,23 +302,17 @@ function waitForImagesLoaded() {
  * 滚动到指定位置并等待渲染完成
  * 支持自定义滚动容器
  */
-function scrollToPosition(y) {
+function scrollToPosition(y, x) {
   return new Promise((resolve) => {
     const container = getScrollContainer();
-    const isNative = container === window || container === document.documentElement || container === document.body;
+    setScrollTop(container, y, x);
 
-    if (isNative) {
-      window.scrollTo(0, y);
-    } else {
-      container.scrollTop = y;
-    }
-
-    document.dispatchEvent(new Event('scroll'));
+    dispatchScrollEvent(container);
 
     // 等待两次 requestAnimationFrame 确保渲染完成
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
-        resolve();
+        resolve(getScrollTop(container));
       });
     });
   });
@@ -355,6 +390,9 @@ function handleGetPageInfo(sendResponse) {
 }
 
 async function handleStartCapture(request, sendResponse) {
+  const originalSelectedIndex = selectedContainerIndex;
+  let initialScrollPositions = null;
+
   try {
     const options = request.options || {};
 
@@ -362,6 +400,13 @@ async function handleStartCapture(request, sendResponse) {
     if (scrollContainers.length === 0) {
       scrollContainers = detectScrollContainers();
     }
+
+    initialScrollPositions = new Map(
+      scrollContainers.map((c, i) => [i, {
+        x: getScrollLeft(c.element),
+        y: getScrollTop(c.element),
+      }])
+    );
 
     // 确定要截取的容器列表
     let indices;
@@ -382,12 +427,17 @@ async function handleStartCapture(request, sendResponse) {
     // 扫描 fixed 元素
     scanFixedElements();
 
-    // 预滚动触发懒加载（用最大容器）
+    // 预滚动所有选中的容器，确保多面板页面的懒加载内容也被触发。
     if (options.preScroll !== false && indices.length > 0) {
       const saveIdx = selectedContainerIndex;
-      selectedContainerIndex = indices[0]; // 用第一个选中的做懒加载
-      await preScrollForLazyLoad();
-      selectedContainerIndex = saveIdx;
+      try {
+        for (const idx of indices) {
+          selectedContainerIndex = idx;
+          await preScrollForLazyLoad();
+        }
+      } finally {
+        selectedContainerIndex = saveIdx;
+      }
     }
 
     // 为每个容器生成独立的 capture plan
@@ -405,10 +455,13 @@ async function handleStartCapture(request, sendResponse) {
       const scrollH = isNative
         ? Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)
         : c.element.scrollHeight;
+      if (!Number.isFinite(viewH) || viewH <= 0 || !Number.isFinite(scrollH) || scrollH <= 0) {
+        throw new Error(`Invalid scroll container size at index ${idx}`);
+      }
       const maxScroll = Math.max(0, scrollH - viewH);
 
       // 步进
-      const stepHeight = Math.floor(viewH * 0.8);
+      const stepHeight = Math.max(1, Math.floor(viewH * 0.8));
 
       // 滚动位置列表
       const positions = [];
@@ -443,13 +496,15 @@ async function handleStartCapture(request, sendResponse) {
         viewportHeight: viewH,
         devicePixelRatio: window.devicePixelRatio || 1,
         scalarHeight: scrollH,
+        initialScrollX: initialScrollPositions.get(idx)?.x || 0,
+        initialScrollY: initialScrollPositions.get(idx)?.y || 0,
         isNative,
         cropRect,
       });
     }
 
     // 恢复默认选中
-    selectedContainerIndex = indices[0] || 0;
+    selectedContainerIndex = indices[0] ?? 0;
 
     sendResponse({
       success: true,
@@ -457,6 +512,16 @@ async function handleStartCapture(request, sendResponse) {
       fixedElementCount: fixedElements.length,
     });
   } catch (error) {
+    // 预滚动或生成计划失败时，也恢复用户开始截图前的页面位置。
+    if (initialScrollPositions) {
+      for (const [idx, y] of initialScrollPositions) {
+        const container = scrollContainers[idx]?.element;
+        if (!container) continue;
+        selectedContainerIndex = idx;
+        setScrollTop(container, y.y, y.x);
+      }
+      selectedContainerIndex = originalSelectedIndex;
+    }
     sendResponse({ success: false, error: error.message });
   }
 }
@@ -464,15 +529,23 @@ async function handleStartCapture(request, sendResponse) {
 async function handleScrollTo(request, sendResponse) {
   try {
     // 支持指定容器索引（多容器模式）
-    if (request.containerIndex !== undefined && scrollContainers[request.containerIndex]) {
+    if (request.containerIndex !== undefined && !scrollContainers[request.containerIndex]) {
+      throw new Error('Scroll container not found');
+    }
+
+    let actualY;
+    if (request.containerIndex !== undefined) {
       const prev = selectedContainerIndex;
       selectedContainerIndex = request.containerIndex;
-      await scrollToPosition(request.y);
-      selectedContainerIndex = prev;
+      try {
+        actualY = await scrollToPosition(request.y, request.x);
+      } finally {
+        selectedContainerIndex = prev;
+      }
     } else {
-      await scrollToPosition(request.y);
+      actualY = await scrollToPosition(request.y, request.x);
     }
-    sendResponse({ success: true });
+    sendResponse({ success: true, y: actualY });
   } catch (error) {
     sendResponse({ success: false, error: error.message });
   }

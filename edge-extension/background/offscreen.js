@@ -9,7 +9,7 @@ const MAX_CANVAS_SIZE = 32767;
 const MAX_CANVAS_AREA = 268000000;
 
 function assertCanvasSize(width, height, label = 'Canvas') {
-  if (width <= 0 || height <= 0) {
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
     throw new Error(`${label} size is invalid: ${width}x${height}`);
   }
   if (width > MAX_CANVAS_SIZE || height > MAX_CANVAS_SIZE || width * height > MAX_CANVAS_AREA) {
@@ -35,8 +35,13 @@ async function handleStitch(request, sendResponse) {
 
     console.log('[Offscreen] Stitching', containerStrips.length, 'containers, compositing:', !!contextFrame);
 
-    const dpr = devicePixelRatio || 1;
-    const fullW = Math.round(viewportWidth * dpr);
+    const dprValue = Number(devicePixelRatio);
+    const dpr = Number.isFinite(dprValue) && dprValue > 0 ? dprValue : 1;
+    const viewportWidthValue = Number(viewportWidth);
+    if (!Number.isFinite(viewportWidthValue) || viewportWidthValue <= 0) {
+      throw new Error(`Viewport width is invalid: ${viewportWidth}`);
+    }
+    const fullW = Math.round(viewportWidthValue * dpr);
 
     // Step 1: 每个容器独立裁剪 + 拼接
     const stitchedStrips = [];
@@ -44,6 +49,11 @@ async function handleStitch(request, sendResponse) {
 
     for (const cs of containerStrips) {
       if (!cs.frames || cs.frames.length === 0) continue;
+      for (const frame of cs.frames) {
+        if (typeof frame.dataUrl !== 'string' || !Number.isFinite(Number(frame.y))) {
+          throw new Error(`Container ${cs.containerIndex} has an invalid capture frame`);
+        }
+      }
 
       // 加载本容器的帧
       let images = await Promise.all(cs.frames.map(f => loadImage(f.dataUrl)));
@@ -52,7 +62,10 @@ async function handleStitch(request, sendResponse) {
       if (cs.cropRect) {
         for (let i = 0; i < images.length; i++) {
           const cropped = cropToRect(images[i], cs.cropRect, dpr);
-          if (cropped) images[i] = cropped;
+          if (!cropped) {
+            throw new Error(`Container ${cs.containerIndex} frame ${i + 1} is outside the visible area`);
+          }
+          images[i] = cropped;
         }
       }
 
@@ -162,8 +175,9 @@ async function handleStitch(request, sendResponse) {
       for (const s of stitchedStrips) {
         if (!s.cropRect) continue;
         const x = Math.round(s.cropRect.left * dpr);
+        const y = topHeight + Math.round(s.cropRect.top * dpr) - minTop;
         ctx.drawImage(s.canvas, 0, 0, s.canvas.width, s.height,
-                      x, topHeight, s.canvas.width, s.height);
+                      x, y, s.canvas.width, s.height);
       }
 
       // 超出上下文高度的区域：左右空白填底色
@@ -255,7 +269,8 @@ function calculateOffsets(images, frames) {
   const offsets = [0];
   for (let i = 1; i < images.length; i++) {
     const prev = images[i - 1], curr = images[i];
-    const estimatedOverlap = prev.height - (frames[i].y - frames[i - 1].y);
+    const delta = Math.max(0, Number(frames[i].y) - Number(frames[i - 1].y));
+    const estimatedOverlap = Math.min(prev.height, curr.height, Math.max(0, prev.height - delta));
     if (estimatedOverlap <= 0) { offsets.push(offsets[i - 1] + prev.height); continue; }
     const actualOverlap = findBestOverlap(prev, curr, estimatedOverlap);
     offsets.push(actualOverlap > 0 ? offsets[i - 1] + prev.height - actualOverlap : offsets[i - 1] + prev.height - estimatedOverlap);
@@ -264,10 +279,11 @@ function calculateOffsets(images, frames) {
 }
 
 function findBestOverlap(prevImage, currImage, estimatedOverlap) {
-  const overlapMin = Math.max(10, Math.floor(estimatedOverlap * 0.5));
   const overlapMax = Math.min(prevImage.height, currImage.height, Math.floor(estimatedOverlap * 1.5));
+  if (overlapMax <= 0) return 0;
+  const overlapMin = Math.min(overlapMax, Math.max(1, Math.floor(estimatedOverlap * 0.5)));
   let bestOverlap = estimatedOverlap, bestScore = Infinity;
-  const sampleColumns = getSampleColumns(prevImage.width);
+  const sampleColumns = getSampleColumns(Math.min(prevImage.width, currImage.width));
   for (let to = overlapMin; to <= overlapMax; to++) {
     let score = 0, n = 0;
     for (const col of sampleColumns) {
@@ -340,15 +356,25 @@ function cropToRect(image, rect, dpr) {
   // 确保不超出原始图片边界
   const imgW = image.naturalWidth || image.width;
   const imgH = image.naturalHeight || image.height;
-  const srcW = Math.min(sw, Math.max(0, imgW - sx));
-  const srcH = Math.min(sh, Math.max(0, imgH - sy));
-  if (srcW <= 0 || srcH <= 0) return null;
-  assertCanvasSize(srcW, srcH, 'Cropped container canvas');
+  const visibleLeft = Math.max(0, sx);
+  const visibleTop = Math.max(0, sy);
+  const visibleRight = Math.min(imgW, sx + sw);
+  const visibleBottom = Math.min(imgH, sy + sh);
+  if (visibleRight <= visibleLeft || visibleBottom <= visibleTop) return null;
+
+  // 保留请求的裁剪尺寸，越出视口的部分保持透明，避免负坐标导致内容错位。
+  assertCanvasSize(sw, sh, 'Cropped container canvas');
   const canvas = document.createElement('canvas');
-  canvas.width = srcW;
-  canvas.height = srcH;
+  canvas.width = sw;
+  canvas.height = sh;
   const ctx = canvas.getContext('2d');
-  ctx.drawImage(image, sx, sy, srcW, srcH, 0, 0, srcW, srcH);
+  const visibleW = visibleRight - visibleLeft;
+  const visibleH = visibleBottom - visibleTop;
+  ctx.drawImage(
+    image,
+    visibleLeft, visibleTop, visibleW, visibleH,
+    visibleLeft - sx, visibleTop - sy, visibleW, visibleH
+  );
   return canvas;
 }
 
@@ -361,10 +387,14 @@ function cropToRect(image, rect, dpr) {
  * @returns {string} eg. "rgb(245,247,250)"
  */
 function sampleBgColor(image, x, y) {
+  const imageW = image.naturalWidth || image.width;
+  const imageH = image.naturalHeight || image.height;
+  const sampleX = Math.min(imageW - 1, Math.max(0, Math.round(x)));
+  const sampleY = Math.min(imageH - 1, Math.max(0, Math.round(y)));
   const c = document.createElement('canvas');
   c.width = 1; c.height = 1;
   const cx = c.getContext('2d');
-  cx.drawImage(image, x, y, 1, 1, 0, 0, 1, 1);
+  cx.drawImage(image, sampleX, sampleY, 1, 1, 0, 0, 1, 1);
   const d = cx.getImageData(0, 0, 1, 1).data;
   return `rgb(${d[0]},${d[1]},${d[2]})`;
 }
