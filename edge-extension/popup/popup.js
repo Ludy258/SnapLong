@@ -11,7 +11,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const progressText = document.getElementById('progressText');
   const progressDetail = document.getElementById('progressDetail');
   const progressPercentage = document.getElementById('progressPercentage');
-  const formatSegments = document.querySelectorAll('.seg-option');
+  const formatSegments = document.querySelectorAll('#formatSelect .seg-option');
   const delayInput = document.getElementById('delayInput');
   const delayValue = document.getElementById('delayValue');
   const savePathInput = document.getElementById('savePathInput');
@@ -22,10 +22,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const headerBadge = document.querySelector('.header-badge');
   const badgeText = headerBadge?.querySelector('.badge-text');
 
-  const keyPopup = document.getElementById('key-popup');
-  const keyCapture = document.getElementById('key-capture');
   const shortcutLink = document.getElementById('shortcutSettingsLink');
-  const container = document.querySelector('.container');
   const themeSegments = document.querySelectorAll('#themeSelect .seg-option');
   const containerSection = document.getElementById('containerSection');
   const containerCheckList = document.getElementById('containerCheckList');
@@ -75,7 +72,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // 恢复主题
     currentTheme = saved.theme || 'auto';
-    themeSegments.forEach(b => b.classList.toggle('active', b.dataset.value === currentTheme));
+    themeSegments.forEach(b => {
+      const active = b.dataset.value === currentTheme;
+      b.classList.toggle('active', active);
+      b.setAttribute('aria-pressed', String(active));
+    });
     applyTheme(currentTheme);
 
     // 恢复保留页眉页脚
@@ -83,18 +84,6 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   // ===================== 快捷键 =====================
-
-  // 读取当前快捷键绑定
-  chrome.commands.getAll((commands) => {
-    for (const cmd of commands) {
-      if (cmd.name === '_execute_action' && keyPopup) {
-        keyPopup.textContent = cmd.shortcut || '未设置';
-      }
-      if (cmd.name === 'capture-long-screenshot' && keyCapture) {
-        keyCapture.textContent = cmd.shortcut || '未设置';
-      }
-    }
-  });
 
   // 点击跳转快捷键设置
   if (shortcutLink) {
@@ -125,7 +114,11 @@ document.addEventListener('DOMContentLoaded', () => {
   themeSegments.forEach(btn => {
     btn.addEventListener('click', () => {
       currentTheme = btn.dataset.value;
-      themeSegments.forEach(b => b.classList.toggle('active', b.dataset.value === currentTheme));
+      themeSegments.forEach(b => {
+        const active = b.dataset.value === currentTheme;
+        b.classList.toggle('active', active);
+        b.setAttribute('aria-pressed', String(active));
+      });
       applyTheme(currentTheme);
       saveOptions();
     });
@@ -140,8 +133,8 @@ document.addEventListener('DOMContentLoaded', () => {
   function updateSavePathHint() {
     const folder = savePathInput.value.trim() || 'SnapLong';
     savePathHint.textContent = saveAsCheck.checked
-      ? `📂 ~/Downloads/${folder}/  (每次询问)`
-      : `📁 ~/Downloads/${folder}/`;
+      ? `每次确认  ~/Downloads/${folder}/`
+      : `保存到  ~/Downloads/${folder}/`;
   }
 
   // ===================== 格式切换 =====================
@@ -155,7 +148,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function setFormat(value) {
     currentFormat = value;
-    formatSegments.forEach(b => b.classList.toggle('active', b.dataset.value === value));
+    formatSegments.forEach(b => {
+      const active = b.dataset.value === value;
+      b.classList.toggle('active', active);
+      b.setAttribute('aria-pressed', String(active));
+    });
   }
 
   // ===================== 状态检测 =====================
@@ -179,7 +176,7 @@ document.addEventListener('DOMContentLoaded', () => {
       if (!swAlive) {
         setBadge('Service Worker 未响应', 'error');
         btnCapture.disabled = btnViewport.disabled = true;
-        showMessage('⚠️ Service Worker 未启动，请刷新扩展', 'error');
+        showMessage('Service Worker 未启动，请刷新扩展', 'error');
         return;
       }
 
@@ -247,9 +244,11 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     selectedContainerIndices = containers.map(c => c.index);
 
+    let rowIndex = 0;
     for (const c of containers) {
       const row = document.createElement('div');
       row.className = 'container-check-item';
+      row.style.setProperty('--row-index', String(rowIndex++));
 
       // 主容器单选（自定义圆点）
       const radioWrap = document.createElement('label');
@@ -377,7 +376,7 @@ document.addEventListener('DOMContentLoaded', () => {
       if (!tab) throw new Error('没有找到活动标签页');
 
       showProgress(true);
-      showMessage('⏳ 正在分析页面...', 'info');
+      showMessage('正在分析页面...', 'info');
 
       if (containerSection && containerSection.style.display !== 'none' && selectedContainerIndices.length === 0) {
         throw new Error('请至少选择一个滚动区域');
@@ -407,12 +406,12 @@ document.addEventListener('DOMContentLoaded', () => {
           ? '请在对话框中选择保存位置'
           : `已保存到 ~/Downloads/${options.savePath}/`;
         const captureCount = response.totalCaptures ?? response.totalFrames ?? 0;
-        showMessage(`✅ 截图完成！${captureCount} 帧 → ${ext}  ${where}`, 'success');
+        showMessage(`截图完成：${captureCount} 帧，已导出 ${ext}。${where}`, 'success');
       } else {
         throw new Error(response?.error || '截图失败');
       }
     } catch (e) {
-      showMessage(`❌ ${e.message}`, 'error');
+      showMessage(e.message, 'error');
       showProgress(false);
     } finally {
       isCapturing = false;
@@ -443,9 +442,9 @@ document.addEventListener('DOMContentLoaded', () => {
         });
       });
 
-      showMessage('✅ 截图已保存', 'success');
+      showMessage('截图已保存', 'success');
     } catch (e) {
-      showMessage(`❌ ${e.message}`, 'error');
+      showMessage(e.message, 'error');
     } finally {
       isCapturing = false;
       btnCapture.disabled = btnViewport.disabled = false;
