@@ -213,6 +213,7 @@ button:focus-visible, input:focus-visible, a:focus-visible { outline: 2px solid 
 .message.hidden { display: none; }
 .message.info { border-left-color: var(--blue); }
 .message.success { border-left-color: var(--success); color: var(--success); }
+.message.warning { border-left-color: var(--warning); color: var(--warning); }
 .message.error { border-left-color: var(--danger); color: var(--danger); }
 .footer { display: flex; justify-content: flex-end; gap: 3px; padding-top: 10px; }
 .footer-icon { width: 30px; height: 30px; border-radius: 5px; color: var(--subtle); text-decoration: none; }

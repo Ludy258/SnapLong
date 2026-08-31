@@ -27,12 +27,14 @@ document.addEventListener('DOMContentLoaded', () => {
   const containerSection = document.getElementById('containerSection');
   const containerCheckList = document.getElementById('containerCheckList');
   const keepHeaderFooterCheck = document.getElementById('keepHeaderFooterCheck');
+  const copyToClipboardCheck = document.getElementById('copyToClipboardCheck');
 
   let isCapturing = false;
   let currentFormat = 'png';
   let currentTheme = 'auto';
   let selectedContainerIndices = [];
   let primaryContainerIndex = 0;
+  let messageTimer = null;
   const MIN_SCROLL_DELAY = 500;
   const MAX_SCROLL_DELAY = 1500;
 
@@ -58,10 +60,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // 恢复保存的设置
   chrome.storage.local.get({
-    savePath: '', saveAs: false, format: 'png', scrollDelay: 500, theme: 'auto', keepHeaderFooter: false
+    savePath: '', saveAs: false, format: 'png', scrollDelay: 500, theme: 'auto',
+    keepHeaderFooter: false, copyToClipboard: false
   }, (saved) => {
     if (saved.savePath) savePathInput.value = saved.savePath;
     saveAsCheck.checked = saved.saveAs;
+    copyToClipboardCheck.checked = saved.copyToClipboard === true;
     const delay = normalizeScrollDelay(saved.scrollDelay);
     delayInput.value = delay;
     delayValue.textContent = `${delay}ms`;
@@ -102,13 +106,15 @@ document.addEventListener('DOMContentLoaded', () => {
       format: currentFormat,
       scrollDelay: normalizeScrollDelay(delayInput.value),
       theme: currentTheme,
-      keepHeaderFooter: keepHeaderFooterCheck.checked
+      keepHeaderFooter: keepHeaderFooterCheck.checked,
+      copyToClipboard: copyToClipboardCheck.checked
     });
   }
 
   savePathInput.addEventListener('input', () => { updateSavePathHint(); saveOptions(); });
   saveAsCheck.addEventListener('change', () => { updateSavePathHint(); saveOptions(); });
   keepHeaderFooterCheck.addEventListener('change', saveOptions);
+  copyToClipboardCheck.addEventListener('change', saveOptions);
 
   // 主题切换
   themeSegments.forEach(btn => {
@@ -236,10 +242,15 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
 
-    // 默认全勾选；主容器决定最终截图高度，因此优先选择最长的滚动区域。
+    // 页面级滚动和内部面板不能混合合成；有自定义面板时默认只选自定义面板。
+    const defaultContainers = containers.some(c => c.isNative !== true)
+      ? containers.filter(c => c.isNative !== true)
+      : containers;
+
+    // 主容器决定最终截图高度，因此优先选择默认集合中最长的滚动区域。
     let maxScrollHeight = 0;
     let maxClientWidth = 0;
-    for (const c of containers) {
+    for (const c of defaultContainers) {
       const isTaller = c.scrollHeight > maxScrollHeight;
       const hasSameHeightAndWiderViewport = c.scrollHeight === maxScrollHeight && c.clientWidth > maxClientWidth;
       if (isTaller || hasSameHeightAndWiderViewport) {
@@ -248,7 +259,7 @@ document.addEventListener('DOMContentLoaded', () => {
         primaryContainerIndex = c.index;
       }
     }
-    selectedContainerIndices = containers.map(c => c.index);
+    selectedContainerIndices = defaultContainers.map(c => c.index);
 
     let rowIndex = 0;
     for (const c of containers) {
@@ -271,8 +282,9 @@ document.addEventListener('DOMContentLoaded', () => {
           `input[type="checkbox"][data-index="${c.index}"]`
         );
         if (checkbox && !checkbox.checked) checkbox.checked = true;
+        enforceContainerMode(c.index, containers);
         updateContainerBadges(containers);
-        syncContainerSelection(containers);
+        syncContainerSelection(containers, c.index);
       });
       const radioDot = document.createElement('span');
       radioDot.className = 'cc-radio-dot';
@@ -310,9 +322,12 @@ document.addEventListener('DOMContentLoaded', () => {
       toggleWrap.title = '截取此区域';
       const cb = document.createElement('input');
       cb.type = 'checkbox';
-      cb.checked = true;
+      cb.checked = selectedContainerIndices.includes(c.index);
       cb.dataset.index = c.index;
-      cb.addEventListener('change', () => syncContainerSelection(containers));
+      cb.addEventListener('change', () => {
+        enforceContainerMode(c.index, containers);
+        syncContainerSelection(containers, c.index);
+      });
       const toggleTrack = document.createElement('span');
       toggleTrack.className = 'cc-toggle-track';
       toggleWrap.appendChild(cb);
@@ -337,11 +352,36 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   /** 同步复选框勾选状态 */
-  function syncContainerSelection(containers) {
+  function enforceContainerMode(changedIndex, containers) {
+    const changed = containers.find(c => c.index === changedIndex);
+    if (!changed) return;
+    const changedCheckbox = containerCheckList.querySelector(
+      `input[type="checkbox"][data-index="${changedIndex}"]`
+    );
+    if (!changedCheckbox?.checked) return;
+
+    const shouldKeepNative = changed.isNative === true;
+    const checkboxes = containerCheckList.querySelectorAll('input[type="checkbox"]');
+    checkboxes.forEach((checkbox) => {
+      const index = parseInt(checkbox.dataset.index);
+      const container = containers.find(c => c.index === index);
+      if (container && container.isNative === shouldKeepNative) return;
+      if (container) checkbox.checked = false;
+    });
+  }
+
+  function syncContainerSelection(containers, changedIndex) {
     const checked = [];
     const cbs = containerCheckList.querySelectorAll('input[type="checkbox"]');
     cbs.forEach(cb => { if (cb.checked) checked.push(parseInt(cb.dataset.index)); });
     selectedContainerIndices = checked;
+
+    if (changedIndex !== undefined) enforceContainerMode(changedIndex, containers);
+    if (changedIndex !== undefined) {
+      selectedContainerIndices = Array.from(containerCheckList.querySelectorAll('input[type="checkbox"]'))
+        .filter(cb => cb.checked)
+        .map(cb => parseInt(cb.dataset.index));
+    }
 
     // 若当前主容器被取消勾选，自动切到第一个勾选项
     if (!selectedContainerIndices.includes(primaryContainerIndex) && selectedContainerIndices.length > 0) {
@@ -397,7 +437,8 @@ document.addEventListener('DOMContentLoaded', () => {
         saveAs: saveAsCheck.checked,
         scrollContainerIndices: hasContainerSelection ? selectedContainerIndices : undefined,
         primaryContainerIndex: hasContainerSelection ? primaryContainerIndex : undefined,
-        keepHeaderFooter: keepHeaderFooterCheck.checked
+        keepHeaderFooter: keepHeaderFooterCheck.checked,
+        copyToClipboard: copyToClipboardCheck.checked
       };
 
       const response = await chrome.runtime.sendMessage({
@@ -412,7 +453,8 @@ document.addEventListener('DOMContentLoaded', () => {
           ? '请在对话框中选择保存位置'
           : `已保存到 ~/Downloads/${options.savePath}/`;
         const captureCount = response.totalCaptures ?? response.totalFrames ?? 0;
-        showMessage(`截图完成：${captureCount} 帧，已导出 ${ext}。${where}`, 'success');
+        const clipboardStatus = getClipboardStatus(options.copyToClipboard, response);
+        showMessage(`截图完成：${captureCount} 帧，已导出 ${ext}。${where}。${clipboardStatus.text}`, clipboardStatus.type);
       } else {
         throw new Error(response?.error || '截图失败');
       }
@@ -435,20 +477,35 @@ document.addEventListener('DOMContentLoaded', () => {
       if (!tab) throw new Error('没有找到活动标签页');
 
       const dataUrl = await chrome.tabs.captureVisibleTab(null, { format: 'png' });
-      const ts = new Date().toISOString().replace(/[:.]/g, '-').substring(0, 19);
-
-      await new Promise((resolve, reject) => {
-        chrome.downloads.download({
-          url: dataUrl,
-          filename: `screenshot_${ts}.png`,
-        }, (downloadId) => {
-          if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
-          else if (!Number.isInteger(downloadId)) reject(new Error('下载未启动'));
-          else resolve(downloadId);
-        });
+      const savePath = savePathInput.value.trim() || 'SnapLong';
+      const saveAs = saveAsCheck.checked;
+      const downloadResponse = await chrome.runtime.sendMessage({
+        action: 'downloadViewport',
+        dataUrl,
+        savePath,
+        saveAs,
       });
+      if (!downloadResponse?.success) {
+        throw new Error(downloadResponse?.error || '下载未启动');
+      }
 
-      showMessage('截图已保存', 'success');
+      let clipboardStatus = { text: '', type: 'success' };
+      if (copyToClipboardCheck.checked) {
+        try {
+          const response = await chrome.runtime.sendMessage({
+            action: 'copyToClipboard',
+            dataUrl,
+          });
+          clipboardStatus = getClipboardStatus(true, response);
+        } catch (error) {
+          clipboardStatus = { text: `但未能复制到剪贴板：${error.message}`, type: 'warning' };
+        }
+      }
+
+      const where = saveAs
+        ? '请在对话框中选择保存位置'
+        : `已保存到 ~/Downloads/${savePath}/`;
+      showMessage(`截图完成。${where}。${clipboardStatus.text}`, clipboardStatus.type);
     } catch (e) {
       showMessage(e.message, 'error');
     } finally {
@@ -488,11 +545,27 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function showMessage(text, type = 'info') {
+    if (messageTimer) {
+      clearTimeout(messageTimer);
+      messageTimer = null;
+    }
     messageSection.className = 'message show ' + type;
     messageText.textContent = text;
     if (type !== 'error') {
-      setTimeout(() => { messageSection.className = 'message hidden'; }, 5000);
+      messageTimer = setTimeout(() => {
+        messageSection.className = 'message hidden';
+        messageTimer = null;
+      }, 5000);
     }
+  }
+
+  function getClipboardStatus(enabled, response) {
+    if (!enabled) return { text: '', type: 'success' };
+    if (response?.clipboardCopied === true) {
+      return { text: '已复制到剪贴板。', type: 'success' };
+    }
+    const error = response?.clipboardError || response?.error || '当前浏览器不支持图片剪贴板';
+    return { text: `但未能复制到剪贴板：${error}`, type: 'warning' };
   }
 
 });

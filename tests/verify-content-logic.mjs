@@ -80,6 +80,15 @@ const independent = context.filterIndependentContainers([
 ]);
 assert.deepEqual(Array.from(independent, item => item.selector), ['left', 'right']);
 
+const belowViewport = element({ top: 840, left: 40, width: 520, height: 650 });
+const visibleOnly = context.filterIndependentContainers([
+  candidate('visible', left.getBoundingClientRect(), left),
+  candidate('below', belowViewport.getBoundingClientRect(), belowViewport),
+]);
+assert.deepEqual(Array.from(visibleOnly, item => item.selector), ['visible']);
+assert.equal(context.isRectFullyVisible({ top: 0, left: 0, width: 1200, height: 800 }), true);
+assert.equal(context.isRectFullyVisible({ top: 1, left: 0, width: 1200, height: 800 }), false);
+
 const pageCandidate = {
   selector: 'page',
   element: nativeScroller,
@@ -96,6 +105,22 @@ const withPage = context.filterIndependentContainers([
 ]);
 assert.deepEqual(Array.from(withPage, item => item.selector), ['page', 'left', 'right']);
 
+const mixedContainers = [
+  { index: 0, isNative: true },
+  { index: 1, isNative: false },
+  { index: 2, isNative: false },
+];
+assert.deepEqual(Array.from(context.resolveCaptureIndices({}, mixedContainers)), [1, 2]);
+assert.deepEqual(Array.from(context.resolveCaptureIndices({ scrollContainerIndex: 0 }, mixedContainers)), [0]);
+assert.deepEqual(
+  Array.from(context.resolveCaptureIndices({ scrollContainerIndices: ['1', 1, 2, 2.5, 99] }, mixedContainers)),
+  [1, 2],
+);
+assert.throws(
+  () => context.resolveCaptureIndices({ scrollContainerIndices: [0, 1] }, mixedContainers),
+  /不能与自定义滚动区域同时选择/,
+);
+
 assert.deepEqual(Array.from(context.createCapturePositions(2000, 500)), [0, 400, 800, 1200, 1500]);
 assert.equal(context.capturePlanLayoutChanged(
   { cropRect: { top: 10, left: 10, width: 300, height: 400 }, viewportWidth: 1200, viewportHeight: 400, scalarHeight: 1800 },
@@ -105,5 +130,13 @@ assert.equal(context.capturePlanLayoutChanged(
   { cropRect: { top: 10, left: 10, width: 300, height: 400 }, viewportWidth: 1200, viewportHeight: 400, scalarHeight: 1800 },
   { cropRect: { top: 11, left: 10, width: 300, height: 400 }, viewportWidth: 1200, viewportHeight: 400, scalarHeight: 1800 },
 ), false);
+assert.equal(context.capturePlanLayoutChanged(
+  { cropRect: null, isNative: true, viewportWidth: 1200, viewportHeight: 800, scalarWidth: 1200, scalarHeight: 2400, devicePixelRatio: 1 },
+  { cropRect: null, isNative: true, viewportWidth: 1200, viewportHeight: 800, scalarWidth: 1320, scalarHeight: 2400, devicePixelRatio: 1 },
+), true);
+assert.equal(context.capturePlanLayoutChanged(
+  { cropRect: null, isNative: true, viewportWidth: 1200, viewportHeight: 800, scalarHeight: 2400, devicePixelRatio: 1 },
+  { cropRect: null, isNative: true, viewportWidth: 1200, viewportHeight: 800, scalarHeight: 2400, devicePixelRatio: 1.25 },
+), true);
 
 console.log('Content-script multi-region logic checks passed.');

@@ -2,7 +2,7 @@
  * Service Worker - SnapLong
  *
  * Manifest V3 Service Worker
- * 负责：协调截图 → 委托 offscreen 拼接 → SW 下载
+ * 负责：协调截图 → 委托 offscreen 拼接/复制 → SW 下载
  */
 
 let captureState = {
@@ -14,6 +14,11 @@ let captureState = {
 const CAPTURE_INTERVAL_MS = 500;
 const MAX_SCROLL_DELAY_MS = 1500;
 let lastCaptureAt = 0;
+let offscreenCreatePromise = null;
+let offscreenClosePromise = null;
+let offscreenLeaseCount = 0;
+let offscreenPendingLeaseCount = 0;
+let offscreenCloseRequested = false;
 
 // ===================== 消息处理 =====================
 
@@ -24,6 +29,18 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       return true;
     case 'ping':
       sendResponse({ success: true, alive: true });
+      return true;
+    case 'copyToClipboard':
+      handleCopyToClipboard(request, sendResponse);
+      return true;
+    case 'writeClipboard':
+      // Handled by the offscreen document — don't respond here.
+      return true;
+    case 'waitClipboard':
+      // Handled by the offscreen document — don't respond here.
+      return true;
+    case 'downloadViewport':
+      handleDownloadViewport(request, sendResponse);
       return true;
     case 'contentScriptReady':
       sendResponse({ success: true });
@@ -48,7 +65,8 @@ chrome.commands.onCommand.addListener(async (command) => {
 
       // 读取保存的设置，直接启动截图（避免自消息不可靠）
       const saved = await chrome.storage.local.get({
-        format: 'png', scrollDelay: 500, savePath: 'SnapLong', saveAs: false, keepHeaderFooter: false
+        format: 'png', scrollDelay: 500, savePath: 'SnapLong', saveAs: false,
+        keepHeaderFooter: false, copyToClipboard: false
       });
 
       handleStartCapture(
@@ -60,6 +78,7 @@ chrome.commands.onCommand.addListener(async (command) => {
             savePath: saved.savePath,
             saveAs: saved.saveAs,
             keepHeaderFooter: saved.keepHeaderFooter,
+            copyToClipboard: saved.copyToClipboard === true,
           }
         },
         tab.id,
@@ -85,6 +104,7 @@ async function handleStartCapture(request, tabId, sendResponse) {
   let capturePlan = null;
   let fixedHidden = false;
   let pageStateRestored = false;
+  let offscreenLease = false;
 
   captureState.isCapturing = true;
   captureState.tabId = tabId;
@@ -111,6 +131,12 @@ async function handleStartCapture(request, tabId, sendResponse) {
     // 懒加载可能在生成初始计划后改变面板位置或高度；正式截图前刷新一次全部计划。
     containerPlans = await Promise.all(containerPlans.map(plan => refreshCapturePlan(tabId, plan)));
     capturePlan.containerPlans = containerPlans;
+
+    const hasNativePlan = containerPlans.some(plan => plan.isNative === true);
+    const hasCustomPlan = containerPlans.some(plan => plan.isNative !== true && plan.cropRect);
+    if (hasNativePlan && hasCustomPlan) {
+      throw new Error('页面级滚动不能与自定义滚动区域同时选择');
+    }
 
     captureState.pageInfo = pageInfo;
     captureState.capturePlan = capturePlan;
@@ -148,16 +174,18 @@ async function handleStartCapture(request, tabId, sendResponse) {
     for (let ci = 0; ci < containerPlans.length; ci++) {
       if (!captureState.isCapturing) break;
 
+      // 已完成的容器必须继续使用同一套页面坐标，避免容器之间拼出混合几何。
+      for (let previousIndex = 0; previousIndex < ci; previousIndex++) {
+        const stablePlan = await refreshCapturePlan(tabId, containerPlans[previousIndex], { reportChange: true });
+        if (stablePlan.layoutChanged) {
+          throw new Error('截图过程中页面布局发生变化，请重新截图');
+        }
+      }
+
       let plan = containerPlans[ci];
       const refreshedPlan = await refreshCapturePlan(tabId, plan, { reportChange: true });
       if (refreshedPlan.layoutChanged) {
-        if (contextFrame) {
-          throw new Error('页面布局在截图过程中发生变化，请重新截图');
-        }
-        totalFrames += refreshedPlan.positions.length - plan.positions.length;
-        plan = refreshedPlan;
-        containerPlans[ci] = plan;
-        capturePlan.containerPlans = containerPlans;
+        throw new Error('截图过程中页面布局发生变化，请重新截图');
       }
       const frames = [];
 
@@ -200,10 +228,19 @@ async function handleStartCapture(request, tabId, sendResponse) {
       if (frames.length > 0) {
         containerStrips.push({
           containerIndex: plan.containerIndex,
+          isNative: plan.isNative === true,
           cropRect: plan.cropRect,
           viewportHeight: plan.viewportHeight,
           frames,
         });
+      }
+    }
+
+    // 最后一个容器没有下一轮循环可触发“已完成容器”校验，合成前再统一确认一次。
+    for (const plan of containerPlans) {
+      const stablePlan = await refreshCapturePlan(tabId, plan, { reportChange: true });
+      if (stablePlan.layoutChanged) {
+        throw new Error('截图过程中页面布局发生变化，请重新截图');
       }
     }
 
@@ -214,7 +251,8 @@ async function handleStartCapture(request, tabId, sendResponse) {
     if (containerStrips.length === 0) throw new Error('No frames captured');
 
     // 6. 创建 offscreen 做拼接
-    await createOffscreen();
+    await acquireOffscreen();
+    offscreenLease = true;
 
     const format = options.format || 'png';
     console.log('[SnapLong] Sending', containerStrips.length, 'container strips to offscreen...');
@@ -227,13 +265,14 @@ async function handleStartCapture(request, tabId, sendResponse) {
       devicePixelRatio: containerPlans[0]?.devicePixelRatio || 1,
       format,
       contextFrame,
+      copyToClipboard: options.copyToClipboard === true,
     });
 
     if (!stitchResult?.success) {
       throw new Error('Stitch failed: ' + (stitchResult?.error || 'unknown'));
     }
 
-    // 7. 下载
+    // 7. 先下载，避免剪贴板异常阻塞文件导出
     const dataUrl = stitchResult.dataUrl;
     const saveOptions = {
       subfolder: options.savePath || 'SnapLong',
@@ -246,7 +285,25 @@ async function handleStartCapture(request, tabId, sendResponse) {
     const downloadId = await downloadDataUrl(dataUrl, filename, saveOptions.saveAs);
     console.log('[SnapLong] Download started, id:', downloadId);
 
-    sendResponse({ success: true, totalFrames: globalFrameIdx, totalCaptures: globalFrameIdx });
+    let clipboardResult = {
+      clipboardCopied: false,
+      clipboardError: '',
+    };
+    if (stitchResult.clipboardTaskId) {
+      try {
+        clipboardResult = await waitForClipboardInOffscreen(stitchResult.clipboardTaskId);
+      } catch (error) {
+        clipboardResult.clipboardError = error?.message || '剪贴板写入失败';
+      }
+    }
+
+    sendResponse({
+      success: true,
+      totalFrames: globalFrameIdx,
+      totalCaptures: globalFrameIdx,
+      clipboardCopied: clipboardResult.clipboardCopied === true,
+      clipboardError: clipboardResult.clipboardError || clipboardResult.error || '',
+    });
 
   } catch (error) {
     console.error('[SnapLong] Error:', error);
@@ -255,30 +312,143 @@ async function handleStartCapture(request, tabId, sendResponse) {
     if (!pageStateRestored && capturePlan) {
       await restorePageState(tabId, capturePlan, fixedHidden);
     }
-    cleanup();
+    if (offscreenLease) {
+      await releaseOffscreen();
+      offscreenLease = false;
+    }
+    await cleanup();
   }
 }
 
 // ===================== Offscreen 管理 =====================
 
 async function createOffscreen() {
-  const existing = await chrome.offscreen.hasDocument();
-  if (existing) return;
+  if (offscreenClosePromise) await offscreenClosePromise;
+  if (offscreenCreatePromise) return offscreenCreatePromise;
 
-  await chrome.offscreen.createDocument({
-    url: 'background/offscreen.html',
-    reasons: ['DOM_SCRAPING', 'BLOBS'],
-    justification: 'Stitch screenshots on canvas',
-  });
-  console.log('[SnapLong] Offscreen created');
-  await sleep(300);
+  offscreenCreatePromise = (async () => {
+    const existing = await chrome.offscreen.hasDocument();
+    if (existing) return;
+
+    await chrome.offscreen.createDocument({
+      url: 'background/offscreen.html',
+      reasons: ['DOM_SCRAPING', 'BLOBS', 'CLIPBOARD'],
+      justification: 'Stitch screenshots on canvas and optionally copy the result to the clipboard',
+    });
+    console.log('[SnapLong] Offscreen created');
+    await sleep(300);
+  })();
+
+  try {
+    await offscreenCreatePromise;
+  } finally {
+    offscreenCreatePromise = null;
+    if (offscreenCloseRequested && offscreenLeaseCount === 0 && offscreenPendingLeaseCount === 0) {
+      closeOffscreenNow().catch(() => {});
+    }
+  }
 }
 
 async function closeOffscreen() {
-  try {
+  offscreenCloseRequested = true;
+  if (offscreenLeaseCount > 0 || offscreenPendingLeaseCount > 0 || offscreenCreatePromise) return;
+  await closeOffscreenNow();
+}
+
+async function closeOffscreenNow() {
+  if (offscreenLeaseCount > 0 || offscreenPendingLeaseCount > 0) return;
+  if (offscreenClosePromise) return offscreenClosePromise;
+
+  offscreenClosePromise = (async () => {
+    if (offscreenCreatePromise) await offscreenCreatePromise;
+    // 创建/关闭之间可能有新的请求进来；重新确认关闭仍然有效，避免
+    // 把刚刚被重新租用的 offscreen 文档关掉。
+    if (!offscreenCloseRequested || offscreenLeaseCount > 0 || offscreenPendingLeaseCount > 0) return;
     const existing = await chrome.offscreen.hasDocument();
+    if (!offscreenCloseRequested || offscreenLeaseCount > 0 || offscreenPendingLeaseCount > 0) return;
     if (existing) await chrome.offscreen.closeDocument();
-  } catch (e) {}
+  })();
+
+  try {
+    await offscreenClosePromise;
+  } catch (e) {
+    console.warn('[SnapLong] Failed to close offscreen:', e?.message || e);
+  } finally {
+    offscreenClosePromise = null;
+  }
+}
+
+async function acquireOffscreen() {
+  offscreenCloseRequested = false;
+  offscreenPendingLeaseCount++;
+  try {
+    await createOffscreen();
+    offscreenLeaseCount++;
+  } finally {
+    offscreenPendingLeaseCount--;
+  }
+}
+
+async function releaseOffscreen() {
+  if (offscreenLeaseCount > 0) offscreenLeaseCount--;
+  if (offscreenLeaseCount === 0 && offscreenPendingLeaseCount === 0 && offscreenCloseRequested) {
+    await closeOffscreenNow();
+  }
+}
+
+async function handleCopyToClipboard(request, sendResponse) {
+  let offscreenLease = false;
+  try {
+    if (typeof request.dataUrl !== 'string' || !request.dataUrl.startsWith('data:')) {
+      throw new Error('没有可复制的截图数据');
+    }
+
+    await acquireOffscreen();
+    offscreenLease = true;
+    const result = await chrome.runtime.sendMessage({
+      action: 'writeClipboard',
+      target: 'offscreen',
+      dataUrl: request.dataUrl,
+    });
+    if (!result?.success) {
+      throw new Error(result?.error || '剪贴板写入失败');
+    }
+    sendResponse({ success: true, clipboardCopied: true });
+  } catch (error) {
+    console.error('[SnapLong] Clipboard error:', error);
+    sendResponse({ success: false, clipboardCopied: false, error: error.message });
+  } finally {
+    if (offscreenLease) await releaseOffscreen();
+    if (!captureState.isCapturing) await closeOffscreen();
+  }
+}
+
+async function waitForClipboardInOffscreen(taskId) {
+  const result = await chrome.runtime.sendMessage({
+    action: 'waitClipboard',
+    target: 'offscreen',
+    taskId,
+  });
+  if (!result) throw new Error('剪贴板任务没有返回结果');
+  return result;
+}
+
+async function handleDownloadViewport(request, sendResponse) {
+  try {
+    if (typeof request.dataUrl !== 'string' || !request.dataUrl.startsWith('data:image/')) {
+      throw new Error('没有可下载的截图数据');
+    }
+    const savePath = typeof request.savePath === 'string' ? request.savePath.trim() : '';
+    const saveAs = request.saveAs === true;
+    const filename = generateFilename('screenshot', 'png', {
+      subfolder: savePath || 'SnapLong',
+    });
+    const downloadId = await downloadDataUrl(request.dataUrl, filename, saveAs);
+    sendResponse({ success: true, downloadId });
+  } catch (error) {
+    console.error('[SnapLong] Viewport download error:', error);
+    sendResponse({ success: false, error: error?.message || '下载未启动' });
+  }
 }
 
 // ===================== 辅助 =====================
@@ -426,9 +596,9 @@ function generateFilename(title, format, saveOptions) {
   return basename;
 }
 
-function cleanup() {
+async function cleanup() {
   captureState = { isCapturing: false, tabId: null, options: {}, frames: [], totalPositions: [], currentIndex: 0, pageInfo: null, capturePlan: null };
-  closeOffscreen();
+  await closeOffscreen();
 }
 
 function notifyProgress({ current, total, containerCurrent, containerTotal, percentage }) {

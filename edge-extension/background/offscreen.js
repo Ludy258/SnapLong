@@ -2,11 +2,14 @@
  * Offscreen Document - 拼接引擎
  *
  * 有完整 DOM API（Image, Canvas, Blob）。
- * 负责：接收截图数据 → 拼接 → 返回 data URL 给 SW 下载。
+ * 负责：接收截图数据 → 拼接/复制到剪贴板 → 返回 data URL 给 SW 下载。
  */
 
 const MAX_CANVAS_SIZE = 32767;
 const MAX_CANVAS_AREA = 268000000;
+const CLIPBOARD_TIMEOUT_MS = 5000;
+let nextClipboardTaskId = 1;
+const clipboardTasks = new Map();
 
 function assertCanvasSize(width, height, label = 'Canvas') {
   if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
@@ -22,6 +25,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     handleStitch(request, sendResponse);
     return true;
   }
+  if (request.action === 'writeClipboard') {
+    handleWriteClipboard(request, sendResponse);
+    return true;
+  }
+  if (request.action === 'waitClipboard') {
+    handleWaitClipboard(request, sendResponse);
+    return true;
+  }
   sendResponse({ success: false, error: 'Unknown: ' + request.action });
   return true;
 });
@@ -29,9 +40,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 async function handleStitch(request, sendResponse) {
   try {
     const { containerStrips, primaryContainerIndex, viewportWidth, devicePixelRatio, format,
-            contextFrame } = request;
+            contextFrame, copyToClipboard } = request;
 
     if (!containerStrips || containerStrips.length === 0) throw new Error('No container strips');
+
+    const hasNativeStrip = containerStrips.some(strip => strip.isNative === true);
+    const hasCustomStrip = containerStrips.some(strip => strip.isNative !== true && strip.cropRect);
+    if (hasNativeStrip && hasCustomStrip) {
+      throw new Error('页面级滚动不能与自定义滚动区域同时合成');
+    }
 
     console.log('[Offscreen] Stitching', containerStrips.length, 'containers, compositing:', !!contextFrame);
 
@@ -247,8 +264,20 @@ async function handleStitch(request, sendResponse) {
       dataUrl = canvas.toDataURL(mimeType, quality);
     }
 
+    // 先返回导出数据，让 Service Worker 尽快开始下载；剪贴板任务单独等待结果。
+    const clipboardTaskId = copyToClipboard === true
+      ? startClipboardTask((isCancelled) => copyCanvasToClipboard(canvas, isCancelled))
+      : '';
+
     console.log('[Offscreen] Output:', Math.round(dataUrl.length / 1024), 'KB');
-    sendResponse({ success: true, dataUrl });
+    sendResponse({
+      success: true,
+      dataUrl,
+      clipboardCopied: false,
+      clipboardError: '',
+      clipboardPending: Boolean(clipboardTaskId),
+      clipboardTaskId,
+    });
 
   } catch (error) {
     console.error('[Offscreen] Error:', error);
@@ -265,61 +294,287 @@ function loadImage(dataUrl) {
   });
 }
 
+async function handleWriteClipboard(request, sendResponse) {
+  try {
+    if (typeof request.dataUrl !== 'string') throw new Error('没有可复制的截图数据');
+    const taskId = startClipboardTask((isCancelled) => copyDataUrlToClipboard(request.dataUrl, isCancelled));
+    sendResponse(await waitForClipboardTask(taskId));
+  } catch (error) {
+    console.error('[Offscreen] Clipboard error:', error);
+    const message = error?.message || '剪贴板写入失败';
+    sendResponse({ success: false, clipboardCopied: false, clipboardError: message, error: message });
+  }
+}
+
+async function handleWaitClipboard(request, sendResponse) {
+  try {
+    if (typeof request.taskId !== 'string' || !request.taskId) {
+      throw new Error('没有可等待的剪贴板任务');
+    }
+    sendResponse(await waitForClipboardTask(request.taskId));
+  } catch (error) {
+    console.error('[Offscreen] Clipboard wait error:', error);
+    const message = error?.message || '剪贴板写入失败';
+    sendResponse({ success: false, clipboardCopied: false, clipboardError: message, error: message });
+  }
+}
+
+function startClipboardTask(taskFactory) {
+  const taskId = String(nextClipboardTaskId++);
+  const state = {
+    cancelled: false,
+    settled: false,
+    result: null,
+    promise: null,
+  };
+
+  state.promise = Promise.resolve()
+    .then(() => taskFactory(() => state.cancelled))
+    .then(
+      () => ({ success: true, clipboardCopied: true, clipboardError: '' }),
+      (error) => ({
+        success: false,
+        clipboardCopied: false,
+        clipboardError: error?.message || '剪贴板写入失败',
+        error: error?.message || '剪贴板写入失败',
+      })
+    )
+    .then((result) => {
+      state.result = result;
+      state.settled = true;
+      if (state.cancelled) clipboardTasks.delete(taskId);
+      return result;
+    });
+
+  clipboardTasks.set(taskId, state);
+  return taskId;
+}
+
+async function waitForClipboardTask(taskId, timeoutMs = CLIPBOARD_TIMEOUT_MS) {
+  const state = clipboardTasks.get(taskId);
+  if (!state) throw new Error('剪贴板任务不存在或已过期');
+  if (state.settled) {
+    clipboardTasks.delete(taskId);
+    return state.result;
+  }
+
+  const timeoutToken = {};
+  let timer;
+  try {
+    const result = await Promise.race([
+      state.promise,
+      new Promise(resolve => {
+        timer = setTimeout(() => resolve(timeoutToken), timeoutMs);
+      }),
+    ]);
+    if (result === timeoutToken) {
+      // 不能取消已经交给浏览器的原生 clipboard.write，但可以阻止后续
+      // 图片加载、DOM fallback 或新的扩展写入继续执行。
+      state.cancelled = true;
+      return {
+        success: false,
+        clipboardCopied: false,
+        clipboardError: '剪贴板写入超时',
+        error: '剪贴板写入超时',
+      };
+    }
+    clipboardTasks.delete(taskId);
+    return result;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function throwIfClipboardCancelled(isCancelled) {
+  if (isCancelled && isCancelled()) throw new Error('剪贴板任务已取消');
+}
+
+async function copyCanvasToClipboard(canvas, isCancelled) {
+  if (!canvas || typeof canvas.toBlob !== 'function') {
+    throw new Error('当前浏览器不支持异步图片编码');
+  }
+
+  const blob = await new Promise((resolve, reject) => {
+    canvas.toBlob((result) => {
+      if (result) resolve(result);
+      else reject(new Error('无法生成剪贴板图片'));
+    }, 'image/png');
+  });
+
+  throwIfClipboardCancelled(isCancelled);
+  await copyImageBlobToClipboard(blob, isCancelled);
+}
+
+async function copyDataUrlToClipboard(dataUrl, isCancelled) {
+  if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:image/')) {
+    throw new Error('没有可复制的图片数据');
+  }
+
+  const response = await fetch(dataUrl);
+  if (!response.ok) throw new Error('无法读取截图数据');
+  const blob = await response.blob();
+  throwIfClipboardCancelled(isCancelled);
+  await copyImageBlobToClipboard(blob, isCancelled);
+}
+
+async function copyImageBlobToClipboard(blob, isCancelled) {
+  const pngBlob = await ensurePngBlob(blob, isCancelled);
+  throwIfClipboardCancelled(isCancelled);
+
+  // 优先使用真正的 ClipboardItem，避免把 HTML 图片引用误当作 PNG 复制成功。
+  try {
+    await writePngBlobToClipboard(pngBlob);
+    return;
+  } catch (apiError) {
+    console.warn('[Offscreen] Clipboard API copy failed:', apiError?.message || apiError);
+  }
+
+  // Offscreen 文档在部分 Edge 版本中无法使用 Clipboard API 时，再尝试 DOM 兼容路径。
+  if (canUseDomCopy()) {
+    try {
+      const imageSource = await blobToDataUrl(pngBlob, isCancelled);
+      throwIfClipboardCancelled(isCancelled);
+      await copyImageWithExecCommand(imageSource, isCancelled);
+      return;
+    } catch (error) {
+      console.warn('[Offscreen] DOM clipboard copy failed:', error?.message || error);
+    }
+  }
+
+  throw new Error('当前浏览器不支持图片剪贴板');
+}
+
+async function ensurePngBlob(blob, isCancelled) {
+  if (!blob) throw new Error('没有可复制的图片数据');
+  if (blob.type === 'image/png') return blob;
+
+  const image = await loadImage(await blobToDataUrl(blob, isCancelled));
+  throwIfClipboardCancelled(isCancelled);
+  const width = image.naturalWidth || image.width;
+  const height = image.naturalHeight || image.height;
+  assertCanvasSize(width, height, 'Clipboard image');
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  canvas.getContext('2d').drawImage(image, 0, 0);
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((result) => {
+      if (result) resolve(result);
+      else reject(new Error('无法转换剪贴板图片为 PNG'));
+    }, 'image/png');
+  });
+}
+
+function blobToDataUrl(blob, isCancelled) {
+  throwIfClipboardCancelled(isCancelled);
+  if (typeof FileReader !== 'function') throw new Error('当前浏览器不支持图片读取');
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        throwIfClipboardCancelled(isCancelled);
+        resolve(reader.result);
+      } catch (error) {
+        reject(error);
+      }
+    };
+    reader.onerror = () => reject(new Error('无法读取剪贴板图片'));
+    reader.readAsDataURL(blob);
+  });
+}
+
+function canUseDomCopy() {
+  return typeof document !== 'undefined' &&
+    document.body &&
+    typeof document.createElement === 'function' &&
+    typeof document.createRange === 'function' &&
+    typeof document.execCommand === 'function' &&
+    typeof window !== 'undefined' &&
+    typeof window.getSelection === 'function';
+}
+
+async function copyImageWithExecCommand(imageSource, isCancelled) {
+  const wrapper = document.createElement('div');
+  const image = document.createElement('img');
+  wrapper.contentEditable = 'true';
+  wrapper.tabIndex = -1;
+  wrapper.style.cssText = 'position:fixed;left:-10000px;top:0;width:1px;height:1px;overflow:hidden;opacity:0;';
+  image.alt = '';
+  wrapper.appendChild(image);
+  document.body.appendChild(wrapper);
+
+  const selection = window.getSelection();
+  if (!selection) {
+    wrapper.remove();
+    throw new Error('当前文档不支持图片选择');
+  }
+  try {
+    await loadClipboardImage(image, imageSource);
+    throwIfClipboardCancelled(isCancelled);
+    wrapper.focus();
+    const range = document.createRange();
+    range.selectNode(image);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    throwIfClipboardCancelled(isCancelled);
+    if (!document.execCommand('copy')) {
+      throw new Error('DOM 复制命令未执行');
+    }
+  } finally {
+    selection.removeAllRanges();
+    wrapper.remove();
+  }
+}
+
+function loadClipboardImage(image, source) {
+  return new Promise((resolve, reject) => {
+    image.onload = resolve;
+    image.onerror = () => reject(new Error('无法加载剪贴板图片'));
+    image.src = source;
+    if (image.complete && (!('naturalWidth' in image) || image.naturalWidth > 0)) {
+      resolve();
+    }
+  });
+}
+
+async function writePngBlobToClipboard(blob) {
+  if (!blob) throw new Error('没有可复制的图片数据');
+  if (!navigator.clipboard || typeof navigator.clipboard.write !== 'function') {
+    throw new Error('当前浏览器不支持图片剪贴板');
+  }
+
+  const ClipboardItemConstructor = globalThis.ClipboardItem;
+  if (typeof ClipboardItemConstructor !== 'function') {
+    throw new Error('当前浏览器不支持图片剪贴板');
+  }
+  if (typeof ClipboardItemConstructor.supports === 'function' &&
+      !ClipboardItemConstructor.supports('image/png')) {
+    throw new Error('当前浏览器不支持 PNG 剪贴板');
+  }
+
+  const pngBlob = blob.type === 'image/png' ? blob : new Blob([blob], { type: 'image/png' });
+  await navigator.clipboard.write([
+    new ClipboardItemConstructor({ 'image/png': pngBlob }),
+  ]);
+}
+
 function calculateOffsets(images, frames) {
+  if (images.length === 0) return [];
+
+  // scrollTop 已经是内容坐标，直接使用它比在重复背景上猜重叠像素可靠。
+  const originY = Number(frames[0]?.y);
   const offsets = [0];
   for (let i = 1; i < images.length; i++) {
-    const prev = images[i - 1], curr = images[i];
-    const delta = Math.max(0, Number(frames[i].y) - Number(frames[i - 1].y));
-    const estimatedOverlap = Math.min(prev.height, curr.height, Math.max(0, prev.height - delta));
-    if (estimatedOverlap <= 0) { offsets.push(offsets[i - 1] + prev.height); continue; }
-    const actualOverlap = findBestOverlap(prev, curr, estimatedOverlap);
-    offsets.push(actualOverlap > 0 ? offsets[i - 1] + prev.height - actualOverlap : offsets[i - 1] + prev.height - estimatedOverlap);
+    const measuredOffset = Number(frames[i]?.y) - originY;
+    const previousOffset = offsets[i - 1];
+    if (Number.isFinite(measuredOffset) && measuredOffset >= previousOffset - 2) {
+      offsets.push(Math.max(previousOffset, Math.round(measuredOffset)));
+    } else {
+      // 异常的非递增滚动坐标不能让后续帧反向覆盖，退化为无重叠拼接。
+      offsets.push(previousOffset + images[i - 1].height);
+    }
   }
   return offsets;
-}
-
-function findBestOverlap(prevImage, currImage, estimatedOverlap) {
-  const overlapMax = Math.min(prevImage.height, currImage.height, Math.floor(estimatedOverlap * 1.5));
-  if (overlapMax <= 0) return 0;
-  const overlapMin = Math.min(overlapMax, Math.max(1, Math.floor(estimatedOverlap * 0.5)));
-  let bestOverlap = estimatedOverlap, bestScore = Infinity;
-  const sampleColumns = getSampleColumns(Math.min(prevImage.width, currImage.width));
-  for (let to = overlapMin; to <= overlapMax; to++) {
-    let score = 0, n = 0;
-    for (const col of sampleColumns) {
-      for (let row = 0; row < to; row++) {
-        const pr = prevImage.height - to + row, cr = row;
-        if (pr < 0 || cr >= currImage.height) continue;
-        const pp = getPixel(prevImage, col, pr), cp = getPixel(currImage, col, cr);
-        score += Math.abs(pp.r - cp.r) + Math.abs(pp.g - cp.g) + Math.abs(pp.b - cp.b);
-        n++;
-      }
-    }
-    if (n > 0) { const a = score / n; if (a < bestScore) { bestScore = a; bestOverlap = to; } }
-  }
-  return bestScore < 30 ? bestOverlap : estimatedOverlap;
-}
-
-function getSampleColumns(width) {
-  const m = 10;
-  if (width <= m * 2 + 3) return [Math.floor(width / 2)];
-  const s = Math.max(1, Math.floor((width - m * 2) / 4));
-  const cols = [];
-  for (let i = m; i < width - m; i += s) cols.push(i);
-  return cols;
-}
-
-function getPixel(image, x, y) {
-  if (!image._canvas) {
-    image._canvas = document.createElement('canvas');
-    image._canvas.width = image.width; image._canvas.height = image.height;
-    image._ctx = image._canvas.getContext('2d');
-    image._ctx.drawImage(image, 0, 0);
-    image._imageData = image._ctx.getImageData(0, 0, image.width, image.height);
-    image._pixels = image._imageData.data;
-  }
-  const idx = (y * image.width + x) * 4;
-  return { r: image._pixels[idx], g: image._pixels[idx + 1], b: image._pixels[idx + 2], a: image._pixels[idx + 3] };
 }
 
 function stitchToCanvas(images, offsets, width, height) {

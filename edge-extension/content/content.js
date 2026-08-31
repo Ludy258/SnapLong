@@ -46,7 +46,8 @@ function detectScrollContainers() {
     const oy = style.overflowY;
     if ((oy === 'auto' || oy === 'scroll' || oy === 'overlay') &&
         el.scrollHeight > el.clientHeight + 5 &&
-        el.offsetWidth > 0 && el.offsetHeight > 0) {
+        el.offsetWidth > 0 && el.offsetHeight > 0 &&
+        isRectFullyVisible(el.getBoundingClientRect())) {
       // 跳过窄元素（很可能是侧边栏）
       if (el.clientWidth < vw * 0.3 && el.clientWidth < 250) continue;
 
@@ -107,6 +108,14 @@ function getContainerCropRect(container) {
   };
 }
 
+function isRectFullyVisible(rect) {
+  if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+  const bottom = Number.isFinite(rect.bottom) ? rect.bottom : rect.top + rect.height;
+  const right = Number.isFinite(rect.right) ? rect.right : rect.left + rect.width;
+  return rect.top >= 0 && rect.left >= 0 &&
+    bottom <= window.innerHeight && right <= window.innerWidth;
+}
+
 function rectArea(rect) {
   return rect ? Math.max(0, rect.width) * Math.max(0, rect.height) : 0;
 }
@@ -127,6 +136,7 @@ function filterIndependentContainers(containers) {
   const customContainers = containers
     .filter(c => !c.isNative)
     .map(c => ({ ...c, rect: getContainerCropRect(c.element) }))
+    .filter(c => isRectFullyVisible(c.rect))
     .sort((a, b) => rectArea(b.rect) - rectArea(a.rect) || b.scrollHeight - a.scrollHeight);
   const accepted = [];
 
@@ -168,16 +178,23 @@ function buildCapturePlan(containerIndex, initialPosition = {}) {
   const container = candidate.element;
   const isNative = isNativeScrollContainer(container);
   const viewportHeight = isNative ? window.innerHeight : container.clientHeight;
+  const scrollWidth = isNative
+    ? Math.max(document.body.scrollWidth, document.documentElement.scrollWidth,
+      document.body.offsetWidth, document.documentElement.offsetWidth,
+      document.body.clientWidth, document.documentElement.clientWidth)
+    : container.scrollWidth;
   const scrollHeight = isNative
     ? Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)
     : container.scrollHeight;
 
-  if (!Number.isFinite(viewportHeight) || viewportHeight <= 0 || !Number.isFinite(scrollHeight) || scrollHeight <= 0) {
+  if (!Number.isFinite(viewportHeight) || viewportHeight <= 0 ||
+      !Number.isFinite(scrollWidth) || scrollWidth <= 0 ||
+      !Number.isFinite(scrollHeight) || scrollHeight <= 0) {
     throw new Error(`Invalid scroll container size at index ${containerIndex}`);
   }
 
   const cropRect = getContainerCropRect(container);
-  if (cropRect && (cropRect.width <= 0 || cropRect.height <= 0)) {
+  if (cropRect && !isRectFullyVisible(cropRect)) {
     throw new Error(`Scroll container is not visible: ${containerIndex}`);
   }
 
@@ -186,6 +203,7 @@ function buildCapturePlan(containerIndex, initialPosition = {}) {
     positions: createCapturePositions(scrollHeight, viewportHeight),
     viewportWidth: window.innerWidth,
     viewportHeight,
+    scalarWidth: scrollWidth,
     devicePixelRatio: window.devicePixelRatio || 1,
     scalarHeight: scrollHeight,
     initialScrollX: Number.isFinite(initialPosition.initialScrollX)
@@ -210,9 +228,14 @@ function cropRectsMatch(first, second, tolerance = 2) {
 function capturePlanLayoutChanged(previousPlan, nextPlan) {
   if (!previousPlan) return false;
   return !cropRectsMatch(previousPlan.cropRect, nextPlan.cropRect) ||
+    previousPlan.isNative !== nextPlan.isNative ||
     Math.abs(Number(previousPlan.viewportHeight) - nextPlan.viewportHeight) > 2 ||
+    Math.abs(Number(previousPlan.scalarWidth) - nextPlan.scalarWidth) > 2 ||
     Math.abs(Number(previousPlan.scalarHeight) - nextPlan.scalarHeight) > 2 ||
-    Math.abs(Number(previousPlan.viewportWidth) - nextPlan.viewportWidth) > 2;
+    Math.abs(Number(previousPlan.viewportWidth) - nextPlan.viewportWidth) > 2 ||
+    (Number.isFinite(Number(previousPlan.devicePixelRatio)) &&
+      Number.isFinite(Number(nextPlan.devicePixelRatio)) &&
+      Math.abs(Number(previousPlan.devicePixelRatio) - Number(nextPlan.devicePixelRatio)) > 0.01);
 }
 
 /**
@@ -351,32 +374,40 @@ function restoreFixedElements() {
  * 快速滚到底部，等待加载，再滚回顶部
  */
 async function preScrollForLazyLoad() {
-  const { scrollHeight, viewportHeight } = getPageDimensions();
-  const totalScroll = Math.max(0, scrollHeight - viewportHeight);
-  const step = Math.max(1, viewportHeight);
-
   const container = getScrollContainer();
 
   function doScroll(y) {
     setScrollTop(container, y);
   }
 
-  // 向下快速滚动
-  let currentScroll = 0;
-  while (currentScroll < totalScroll) {
-    currentScroll = Math.min(currentScroll + step, totalScroll);
-    doScroll(currentScroll);
-    // 触发 IntersectionObserver 等懒加载机制
-    dispatchScrollEvent(container);
-    // 小延迟让懒加载触发
-    await sleep(30);
+  // 懒加载可能在首次到底后继续增加 scrollHeight；最多重新探测几轮，
+  // 避免计划在内容尚未展开时就固定下来。
+  let previousExtent = -1;
+  for (let pass = 0; pass < 3; pass++) {
+    const { scrollHeight, viewportHeight } = getPageDimensions();
+    const totalScroll = Math.max(0, scrollHeight - viewportHeight);
+    const step = Math.max(1, viewportHeight);
+
+    // 向下快速滚动
+    let currentScroll = 0;
+    while (currentScroll < totalScroll) {
+      currentScroll = Math.min(currentScroll + step, totalScroll);
+      doScroll(currentScroll);
+      // 触发 IntersectionObserver 等懒加载机制
+      dispatchScrollEvent(container);
+      // 小延迟让懒加载触发
+      await sleep(30);
+    }
+
+    // 等待图片加载和可能由到底触发的异步内容。
+    await waitForImagesLoaded();
+    await sleep(500);
+
+    const after = getPageDimensions();
+    const afterExtent = Math.max(0, after.scrollHeight - after.viewportHeight);
+    if (afterExtent <= totalScroll + 2 || afterExtent <= previousExtent + 2) break;
+    previousExtent = afterExtent;
   }
-
-  // 等待图片加载
-  await waitForImagesLoaded();
-
-  // 再等待一下，让可能的 API 请求完成
-  await sleep(500);
 
   // 滚回顶部
   doScroll(0);
@@ -399,29 +430,42 @@ function waitForImagesLoaded() {
     }
 
     let loaded = 0;
-    function onLoad() {
-      loaded++;
-      if (loaded >= total) {
-        resolve();
+    let settled = false;
+    let timer = null;
+    const pendingImages = [];
+
+    function finish() {
+      if (settled) return;
+      settled = true;
+      if (timer !== null) clearTimeout(timer);
+      for (const img of pendingImages) {
+        img.removeEventListener('load', onLoad);
+        img.removeEventListener('error', onLoad);
       }
+      resolve();
+    }
+
+    function onLoad() {
+      if (settled) return;
+      loaded++;
+      if (loaded >= total) finish();
     }
 
     for (const img of images) {
       if (img.complete) {
         loaded++;
       } else {
+        pendingImages.push(img);
         img.addEventListener('load', onLoad);
         img.addEventListener('error', onLoad); // 加载失败也算完成
       }
     }
 
     // 如果所有图片已经完成
-    if (loaded >= total) {
-      resolve();
-    }
+    if (loaded >= total) finish();
 
     // 超时保护：最多等 5 秒
-    setTimeout(resolve, 5000);
+    if (!settled) timer = setTimeout(finish, 5000);
   });
 }
 
@@ -505,6 +549,7 @@ function handleGetPageInfo(sendResponse) {
   // 返回容器列表（不含 DOM 引用，可序列化）
   const containerList = scrollContainers.map(c => ({
     index: c.index,
+    isNative: c.isNative === true,
     scrollHeight: c.scrollHeight,
     scrollWidth: c.scrollWidth,
     clientWidth: c.clientWidth,
@@ -543,16 +588,7 @@ async function handleStartCapture(request, sendResponse) {
     );
 
     // 确定要截取的容器列表
-    let indices;
-    if (Array.isArray(options.scrollContainerIndices)) {
-      indices = options.scrollContainerIndices.filter(i => scrollContainers[i]);
-    } else if (options.scrollContainerIndex !== undefined && scrollContainers[options.scrollContainerIndex]) {
-      // 向后兼容：单容器模式
-      indices = [options.scrollContainerIndex];
-    } else {
-      // 默认：全选
-      indices = scrollContainers.map((_, i) => i);
-    }
+    const indices = resolveCaptureIndices(options, scrollContainers);
 
     if (indices.length === 0) {
       throw new Error('No scroll containers selected');
@@ -601,6 +637,41 @@ async function handleStartCapture(request, sendResponse) {
     }
     sendResponse({ success: false, error: error.message });
   }
+}
+
+function resolveCaptureIndices(options = {}, containers = scrollContainers) {
+  const hasExplicitSelection = Array.isArray(options.scrollContainerIndices) ||
+    options.scrollContainerIndex !== undefined;
+  let indices;
+  if (Array.isArray(options.scrollContainerIndices)) {
+    const seen = new Set();
+    indices = options.scrollContainerIndices
+      .map(value => Number(value))
+      .filter(index => {
+        if (!Number.isInteger(index) || !containers[index] || seen.has(index)) return false;
+        seen.add(index);
+        return true;
+      });
+  } else if (options.scrollContainerIndex !== undefined && containers[options.scrollContainerIndex]) {
+    // 向后兼容：单容器模式
+    indices = [options.scrollContainerIndex];
+  } else {
+    // 默认：全选
+    indices = containers.map((_, i) => i);
+  }
+
+  // 页面级滚动和内部面板使用不同坐标系，不能在同一张图中直接合成。
+  // 默认优先截取自定义面板；显式混选则尽早报错，避免输出错位图片。
+  const hasNative = indices.some(i => containers[i]?.isNative);
+  const customIndices = indices.filter(i => !containers[i]?.isNative);
+  if (hasNative && customIndices.length > 0) {
+    if (hasExplicitSelection) {
+      throw new Error('页面级滚动不能与自定义滚动区域同时选择');
+    }
+    indices = customIndices;
+  }
+
+  return indices;
 }
 
 async function handleScrollTo(request, sendResponse) {

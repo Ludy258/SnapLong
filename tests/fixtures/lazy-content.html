@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SnapLong Fixture - Lazy Content</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; min-width: 760px; background: #edf3f4; color: #14232b; font: 14px/1.45 "Segoe UI", "Microsoft YaHei", sans-serif; }
+    header { height: 56px; padding: 17px 24px; border-bottom: 1px solid #cbd8db; background: #ffffff; font-weight: 700; }
+    main { height: 560px; padding: 18px 24px; }
+    #lazy-panel { height: 100%; overflow-y: auto; border: 2px solid #0f766e; background: #ffffff; }
+    .panel-title { position: sticky; top: 0; padding: 12px 16px; border-bottom: 1px solid #d7e1e2; background: #e0f2ef; color: #0f766e; font-weight: 700; }
+    .row { min-height: 84px; margin: 12px 16px; padding: 14px; border: 1px solid #d7e1e2; background: #f9fbfb; }
+    #status { padding: 10px 16px; color: #5d7078; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <header>SnapLong fixture: lazy content expansion</header>
+  <main>
+    <section id="lazy-panel" aria-label="Lazy content panel">
+      <div class="panel-title">Lazy content panel</div>
+      <div id="status">Loaded 8 items. Scroll to the bottom to load more.</div>
+      <div id="rows"></div>
+    </section>
+  </main>
+  <script>
+    const rows = document.getElementById('rows');
+    const status = document.getElementById('status');
+    let loaded = 0;
+    const batchSize = 4;
+    const maxItems = 28;
+
+    function appendBatch() {
+      const next = Math.min(maxItems, loaded + batchSize);
+      for (let i = loaded + 1; i <= next; i++) {
+        const row = document.createElement('article');
+        row.className = 'row';
+        row.textContent = `Lazy item ${i}`;
+        rows.appendChild(row);
+      }
+      loaded = next;
+      status.textContent = `Loaded ${loaded} of ${maxItems} items.`;
+    }
+
+    appendBatch();
+    appendBatch();
+    document.getElementById('lazy-panel').addEventListener('scroll', (event) => {
+      const panel = event.currentTarget;
+      if (loaded < maxItems && panel.scrollTop + panel.clientHeight >= panel.scrollHeight - 48) {
+        appendBatch();
+      }
+    });
+  </script>
+</body>
+</html>
