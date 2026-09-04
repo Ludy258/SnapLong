@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "SnapLong",
-  "version": "1.3.2",
+  "version": "1.3.4",
   "description": "一键滚动截取整个网页，支持 PNG/JPEG/PDF 导出",
   "permissions": [
     "activeTab",

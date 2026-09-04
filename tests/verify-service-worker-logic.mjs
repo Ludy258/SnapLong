@@ -9,6 +9,7 @@ let lastDownload = null;
 let hasDocumentStarted = null;
 let releaseHasDocument = null;
 let blockHasDocument = false;
+let lastScript = null;
 const messageListeners = [];
 
 const context = {
@@ -40,12 +41,17 @@ const context = {
     },
     tabs: {
       query: async () => [],
-      get: async () => null,
+      get: async tabId => ({ id: tabId, active: true, windowId: 1 }),
       sendMessage() {},
       captureVisibleTab() {},
     },
     storage: { local: { get: async () => ({}) } },
-    scripting: { executeScript: async () => {} },
+  scripting: {
+    executeScript: async details => {
+      lastScript = details;
+      return [{ result: { success: true, clipboardCopied: true, clipboardError: '' } }];
+    },
+  },
     downloads: {
       download: (options, callback) => {
         lastDownload = options;
@@ -113,5 +119,22 @@ const viewportResponse = await new Promise((resolve) => {
 assert.equal(viewportResponse.success, true);
 assert.equal(lastDownload.saveAs, true);
 assert.match(lastDownload.filename, /^ViewportShots\/screenshot_.*\.png$/);
+
+const clipboardResponse = await new Promise((resolve) => {
+  messageListeners[0](
+    {
+      action: 'copyToClipboard',
+      tabId: 42,
+      dataUrl: 'data:image/png;base64,AA==',
+    },
+    {},
+    resolve,
+  );
+});
+assert.equal(clipboardResponse.success, true);
+assert.equal(clipboardResponse.clipboardCopied, true);
+assert.equal(lastScript.target.tabId, 42);
+assert.equal(lastScript.args[0], 'data:image/png;base64,AA==');
+assert.equal(typeof lastScript.func, 'function');
 
 console.log('Service-worker lifecycle checks passed.');

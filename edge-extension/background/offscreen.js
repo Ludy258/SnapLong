@@ -2,14 +2,11 @@
  * Offscreen Document - 拼接引擎
  *
  * 有完整 DOM API（Image, Canvas, Blob）。
- * 负责：接收截图数据 → 拼接/复制到剪贴板 → 返回 data URL 给 SW 下载。
+ * 负责：接收截图数据 → Canvas 拼接 → 返回导出数据给 SW 下载。
  */
 
 const MAX_CANVAS_SIZE = 32767;
 const MAX_CANVAS_AREA = 268000000;
-const CLIPBOARD_TIMEOUT_MS = 5000;
-let nextClipboardTaskId = 1;
-const clipboardTasks = new Map();
 
 function assertCanvasSize(width, height, label = 'Canvas') {
   if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
@@ -23,14 +20,6 @@ function assertCanvasSize(width, height, label = 'Canvas') {
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'stitch') {
     handleStitch(request, sendResponse);
-    return true;
-  }
-  if (request.action === 'writeClipboard') {
-    handleWriteClipboard(request, sendResponse);
-    return true;
-  }
-  if (request.action === 'waitClipboard') {
-    handleWaitClipboard(request, sendResponse);
     return true;
   }
   sendResponse({ success: false, error: 'Unknown: ' + request.action });
@@ -264,19 +253,17 @@ async function handleStitch(request, sendResponse) {
       dataUrl = canvas.toDataURL(mimeType, quality);
     }
 
-    // 先返回导出数据，让 Service Worker 尽快开始下载；剪贴板任务单独等待结果。
-    const clipboardTaskId = copyToClipboard === true
-      ? startClipboardTask((isCancelled) => copyCanvasToClipboard(canvas, isCancelled))
+    // 剪贴板必须由当前活动网页写入，不能在无法获得焦点的 Offscreen 文档中写入。
+    // JPEG/PDF 导出也统一复制为 PNG，确保目标应用拿到真正的图片数据。
+    const clipboardDataUrl = copyToClipboard === true
+      ? (format === 'png' ? dataUrl : canvas.toDataURL('image/png'))
       : '';
 
     console.log('[Offscreen] Output:', Math.round(dataUrl.length / 1024), 'KB');
     sendResponse({
       success: true,
       dataUrl,
-      clipboardCopied: false,
-      clipboardError: '',
-      clipboardPending: Boolean(clipboardTaskId),
-      clipboardTaskId,
+      clipboardDataUrl,
     });
 
   } catch (error) {
@@ -292,270 +279,6 @@ function loadImage(dataUrl) {
     img.onerror = () => reject(new Error('Failed to load image'));
     img.src = dataUrl;
   });
-}
-
-async function handleWriteClipboard(request, sendResponse) {
-  try {
-    if (typeof request.dataUrl !== 'string') throw new Error('没有可复制的截图数据');
-    const taskId = startClipboardTask((isCancelled) => copyDataUrlToClipboard(request.dataUrl, isCancelled));
-    sendResponse(await waitForClipboardTask(taskId));
-  } catch (error) {
-    console.error('[Offscreen] Clipboard error:', error);
-    const message = error?.message || '剪贴板写入失败';
-    sendResponse({ success: false, clipboardCopied: false, clipboardError: message, error: message });
-  }
-}
-
-async function handleWaitClipboard(request, sendResponse) {
-  try {
-    if (typeof request.taskId !== 'string' || !request.taskId) {
-      throw new Error('没有可等待的剪贴板任务');
-    }
-    sendResponse(await waitForClipboardTask(request.taskId));
-  } catch (error) {
-    console.error('[Offscreen] Clipboard wait error:', error);
-    const message = error?.message || '剪贴板写入失败';
-    sendResponse({ success: false, clipboardCopied: false, clipboardError: message, error: message });
-  }
-}
-
-function startClipboardTask(taskFactory) {
-  const taskId = String(nextClipboardTaskId++);
-  const state = {
-    cancelled: false,
-    settled: false,
-    result: null,
-    promise: null,
-  };
-
-  state.promise = Promise.resolve()
-    .then(() => taskFactory(() => state.cancelled))
-    .then(
-      () => ({ success: true, clipboardCopied: true, clipboardError: '' }),
-      (error) => ({
-        success: false,
-        clipboardCopied: false,
-        clipboardError: error?.message || '剪贴板写入失败',
-        error: error?.message || '剪贴板写入失败',
-      })
-    )
-    .then((result) => {
-      state.result = result;
-      state.settled = true;
-      if (state.cancelled) clipboardTasks.delete(taskId);
-      return result;
-    });
-
-  clipboardTasks.set(taskId, state);
-  return taskId;
-}
-
-async function waitForClipboardTask(taskId, timeoutMs = CLIPBOARD_TIMEOUT_MS) {
-  const state = clipboardTasks.get(taskId);
-  if (!state) throw new Error('剪贴板任务不存在或已过期');
-  if (state.settled) {
-    clipboardTasks.delete(taskId);
-    return state.result;
-  }
-
-  const timeoutToken = {};
-  let timer;
-  try {
-    const result = await Promise.race([
-      state.promise,
-      new Promise(resolve => {
-        timer = setTimeout(() => resolve(timeoutToken), timeoutMs);
-      }),
-    ]);
-    if (result === timeoutToken) {
-      // 不能取消已经交给浏览器的原生 clipboard.write，但可以阻止后续
-      // 图片加载、DOM fallback 或新的扩展写入继续执行。
-      state.cancelled = true;
-      return {
-        success: false,
-        clipboardCopied: false,
-        clipboardError: '剪贴板写入超时',
-        error: '剪贴板写入超时',
-      };
-    }
-    clipboardTasks.delete(taskId);
-    return result;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-function throwIfClipboardCancelled(isCancelled) {
-  if (isCancelled && isCancelled()) throw new Error('剪贴板任务已取消');
-}
-
-async function copyCanvasToClipboard(canvas, isCancelled) {
-  if (!canvas || typeof canvas.toBlob !== 'function') {
-    throw new Error('当前浏览器不支持异步图片编码');
-  }
-
-  const blob = await new Promise((resolve, reject) => {
-    canvas.toBlob((result) => {
-      if (result) resolve(result);
-      else reject(new Error('无法生成剪贴板图片'));
-    }, 'image/png');
-  });
-
-  throwIfClipboardCancelled(isCancelled);
-  await copyImageBlobToClipboard(blob, isCancelled);
-}
-
-async function copyDataUrlToClipboard(dataUrl, isCancelled) {
-  if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:image/')) {
-    throw new Error('没有可复制的图片数据');
-  }
-
-  const response = await fetch(dataUrl);
-  if (!response.ok) throw new Error('无法读取截图数据');
-  const blob = await response.blob();
-  throwIfClipboardCancelled(isCancelled);
-  await copyImageBlobToClipboard(blob, isCancelled);
-}
-
-async function copyImageBlobToClipboard(blob, isCancelled) {
-  const pngBlob = await ensurePngBlob(blob, isCancelled);
-  throwIfClipboardCancelled(isCancelled);
-
-  // 优先使用真正的 ClipboardItem，避免把 HTML 图片引用误当作 PNG 复制成功。
-  try {
-    await writePngBlobToClipboard(pngBlob);
-    return;
-  } catch (apiError) {
-    console.warn('[Offscreen] Clipboard API copy failed:', apiError?.message || apiError);
-  }
-
-  // Offscreen 文档在部分 Edge 版本中无法使用 Clipboard API 时，再尝试 DOM 兼容路径。
-  if (canUseDomCopy()) {
-    try {
-      const imageSource = await blobToDataUrl(pngBlob, isCancelled);
-      throwIfClipboardCancelled(isCancelled);
-      await copyImageWithExecCommand(imageSource, isCancelled);
-      return;
-    } catch (error) {
-      console.warn('[Offscreen] DOM clipboard copy failed:', error?.message || error);
-    }
-  }
-
-  throw new Error('当前浏览器不支持图片剪贴板');
-}
-
-async function ensurePngBlob(blob, isCancelled) {
-  if (!blob) throw new Error('没有可复制的图片数据');
-  if (blob.type === 'image/png') return blob;
-
-  const image = await loadImage(await blobToDataUrl(blob, isCancelled));
-  throwIfClipboardCancelled(isCancelled);
-  const width = image.naturalWidth || image.width;
-  const height = image.naturalHeight || image.height;
-  assertCanvasSize(width, height, 'Clipboard image');
-  const canvas = document.createElement('canvas');
-  canvas.width = width;
-  canvas.height = height;
-  canvas.getContext('2d').drawImage(image, 0, 0);
-  return new Promise((resolve, reject) => {
-    canvas.toBlob((result) => {
-      if (result) resolve(result);
-      else reject(new Error('无法转换剪贴板图片为 PNG'));
-    }, 'image/png');
-  });
-}
-
-function blobToDataUrl(blob, isCancelled) {
-  throwIfClipboardCancelled(isCancelled);
-  if (typeof FileReader !== 'function') throw new Error('当前浏览器不支持图片读取');
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      try {
-        throwIfClipboardCancelled(isCancelled);
-        resolve(reader.result);
-      } catch (error) {
-        reject(error);
-      }
-    };
-    reader.onerror = () => reject(new Error('无法读取剪贴板图片'));
-    reader.readAsDataURL(blob);
-  });
-}
-
-function canUseDomCopy() {
-  return typeof document !== 'undefined' &&
-    document.body &&
-    typeof document.createElement === 'function' &&
-    typeof document.createRange === 'function' &&
-    typeof document.execCommand === 'function' &&
-    typeof window !== 'undefined' &&
-    typeof window.getSelection === 'function';
-}
-
-async function copyImageWithExecCommand(imageSource, isCancelled) {
-  const wrapper = document.createElement('div');
-  const image = document.createElement('img');
-  wrapper.contentEditable = 'true';
-  wrapper.tabIndex = -1;
-  wrapper.style.cssText = 'position:fixed;left:-10000px;top:0;width:1px;height:1px;overflow:hidden;opacity:0;';
-  image.alt = '';
-  wrapper.appendChild(image);
-  document.body.appendChild(wrapper);
-
-  const selection = window.getSelection();
-  if (!selection) {
-    wrapper.remove();
-    throw new Error('当前文档不支持图片选择');
-  }
-  try {
-    await loadClipboardImage(image, imageSource);
-    throwIfClipboardCancelled(isCancelled);
-    wrapper.focus();
-    const range = document.createRange();
-    range.selectNode(image);
-    selection.removeAllRanges();
-    selection.addRange(range);
-    throwIfClipboardCancelled(isCancelled);
-    if (!document.execCommand('copy')) {
-      throw new Error('DOM 复制命令未执行');
-    }
-  } finally {
-    selection.removeAllRanges();
-    wrapper.remove();
-  }
-}
-
-function loadClipboardImage(image, source) {
-  return new Promise((resolve, reject) => {
-    image.onload = resolve;
-    image.onerror = () => reject(new Error('无法加载剪贴板图片'));
-    image.src = source;
-    if (image.complete && (!('naturalWidth' in image) || image.naturalWidth > 0)) {
-      resolve();
-    }
-  });
-}
-
-async function writePngBlobToClipboard(blob) {
-  if (!blob) throw new Error('没有可复制的图片数据');
-  if (!navigator.clipboard || typeof navigator.clipboard.write !== 'function') {
-    throw new Error('当前浏览器不支持图片剪贴板');
-  }
-
-  const ClipboardItemConstructor = globalThis.ClipboardItem;
-  if (typeof ClipboardItemConstructor !== 'function') {
-    throw new Error('当前浏览器不支持图片剪贴板');
-  }
-  if (typeof ClipboardItemConstructor.supports === 'function' &&
-      !ClipboardItemConstructor.supports('image/png')) {
-    throw new Error('当前浏览器不支持 PNG 剪贴板');
-  }
-
-  const pngBlob = blob.type === 'image/png' ? blob : new Blob([blob], { type: 'image/png' });
-  await navigator.clipboard.write([
-    new ClipboardItemConstructor({ 'image/png': pngBlob }),
-  ]);
 }
 
 function calculateOffsets(images, frames) {

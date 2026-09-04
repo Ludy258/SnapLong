@@ -448,12 +448,26 @@ document.addEventListener('DOMContentLoaded', () => {
       showProgress(false);
 
       if (response?.success) {
+        let clipboardResponse = response;
+        if (options.copyToClipboard && response.clipboardDataUrl && response.clipboardCopied !== true) {
+          try {
+            clipboardResponse = await writePngToExtensionClipboard(response.clipboardDataUrl);
+          } catch (error) {
+            clipboardResponse = {
+              success: false,
+              clipboardCopied: false,
+              clipboardError: error?.message || '剪贴板写入失败',
+              error: error?.message || '剪贴板写入失败',
+            };
+          }
+        }
+
         const ext = { png: 'PNG', jpeg: 'JPG', pdf: 'PDF' }[currentFormat] || 'PNG';
         const where = options.saveAs
           ? '请在对话框中选择保存位置'
           : `已保存到 ~/Downloads/${options.savePath}/`;
         const captureCount = response.totalCaptures ?? response.totalFrames ?? 0;
-        const clipboardStatus = getClipboardStatus(options.copyToClipboard, response);
+        const clipboardStatus = getClipboardStatus(options.copyToClipboard, clipboardResponse);
         showMessage(`截图完成：${captureCount} 帧，已导出 ${ext}。${where}。${clipboardStatus.text}`, clipboardStatus.type);
       } else {
         throw new Error(response?.error || '截图失败');
@@ -492,10 +506,7 @@ document.addEventListener('DOMContentLoaded', () => {
       let clipboardStatus = { text: '', type: 'success' };
       if (copyToClipboardCheck.checked) {
         try {
-          const response = await chrome.runtime.sendMessage({
-            action: 'copyToClipboard',
-            dataUrl,
-          });
+          const response = await writePngToExtensionClipboard(dataUrl);
           clipboardStatus = getClipboardStatus(true, response);
         } catch (error) {
           clipboardStatus = { text: `但未能复制到剪贴板：${error.message}`, type: 'warning' };
@@ -511,6 +522,41 @@ document.addEventListener('DOMContentLoaded', () => {
     } finally {
       isCapturing = false;
       btnCapture.disabled = btnViewport.disabled = false;
+    }
+  }
+
+  async function writePngToExtensionClipboard(dataUrl) {
+    if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:image/png')) {
+      throw new Error('没有可复制的 PNG 图片');
+    }
+    if (window.isSecureContext === false || !navigator.clipboard ||
+        typeof navigator.clipboard.write !== 'function') {
+      throw new Error('扩展页面不支持图片剪贴板，请重新打开插件后重试');
+    }
+
+    const ClipboardItemConstructor = globalThis.ClipboardItem;
+    if (typeof ClipboardItemConstructor !== 'function') {
+      throw new Error('当前浏览器不支持 PNG 剪贴板');
+    }
+    if (typeof ClipboardItemConstructor.supports === 'function' &&
+        !ClipboardItemConstructor.supports('image/png')) {
+      throw new Error('当前浏览器不支持 PNG 剪贴板');
+    }
+
+    try {
+      const response = await fetch(dataUrl);
+      if (!response.ok) throw new Error('无法读取截图数据');
+      const blob = await response.blob();
+      const pngBlob = blob.type === 'image/png' ? blob : new Blob([blob], { type: 'image/png' });
+      await navigator.clipboard.write([
+        new ClipboardItemConstructor({ 'image/png': pngBlob }),
+      ]);
+      return { success: true, clipboardCopied: true, clipboardError: '' };
+    } catch (error) {
+      if (error?.name === 'NotAllowedError') {
+        throw new Error('Edge 拒绝了扩展弹窗的图片剪贴板写入，请重新打开插件后重试');
+      }
+      throw new Error(error?.message || '剪贴板写入失败');
     }
   }
 
@@ -564,7 +610,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (response?.clipboardCopied === true) {
       return { text: '已复制到剪贴板。', type: 'success' };
     }
-    const error = response?.clipboardError || response?.error || '当前浏览器不支持图片剪贴板';
+    const error = response?.clipboardError || response?.error || '复制未返回明确结果，请重新加载扩展后重试';
     return { text: `但未能复制到剪贴板：${error}`, type: 'warning' };
   }
 

@@ -2,7 +2,7 @@
  * Service Worker - SnapLong
  *
  * Manifest V3 Service Worker
- * 负责：协调截图 → 委托 offscreen 拼接/复制 → SW 下载
+ * 负责：协调截图 → 委托 offscreen 拼接 → SW 下载/网页剪贴板写入
  */
 
 let captureState = {
@@ -32,12 +32,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       return true;
     case 'copyToClipboard':
       handleCopyToClipboard(request, sendResponse);
-      return true;
-    case 'writeClipboard':
-      // Handled by the offscreen document — don't respond here.
-      return true;
-    case 'waitClipboard':
-      // Handled by the offscreen document — don't respond here.
       return true;
     case 'downloadViewport':
       handleDownloadViewport(request, sendResponse);
@@ -285,17 +279,20 @@ async function handleStartCapture(request, tabId, sendResponse) {
     const downloadId = await downloadDataUrl(dataUrl, filename, saveOptions.saveAs);
     console.log('[SnapLong] Download started, id:', downloadId);
 
-    let clipboardResult = {
-      clipboardCopied: false,
-      clipboardError: '',
-    };
-    if (stitchResult.clipboardTaskId) {
+    let clipboardResult = { clipboardCopied: false, clipboardError: '' };
+    if (stitchResult.clipboardDataUrl) {
       try {
-        clipboardResult = await waitForClipboardInOffscreen(stitchResult.clipboardTaskId);
+        clipboardResult = await writeClipboardToTab(tabId, stitchResult.clipboardDataUrl);
       } catch (error) {
         clipboardResult.clipboardError = error?.message || '剪贴板写入失败';
       }
     }
+
+    // 如果网页上下文被站点的权限策略拒绝，交给仍然打开的扩展弹窗重试。
+    // 弹窗是扩展自己的安全上下文，不受目标网站的 clipboard 权限策略影响。
+    const clipboardDataUrl = stitchResult.clipboardDataUrl && clipboardResult.clipboardCopied !== true
+      ? stitchResult.clipboardDataUrl
+      : '';
 
     sendResponse({
       success: true,
@@ -303,6 +300,7 @@ async function handleStartCapture(request, tabId, sendResponse) {
       totalCaptures: globalFrameIdx,
       clipboardCopied: clipboardResult.clipboardCopied === true,
       clipboardError: clipboardResult.clipboardError || clipboardResult.error || '',
+      clipboardDataUrl,
     });
 
   } catch (error) {
@@ -332,8 +330,8 @@ async function createOffscreen() {
 
     await chrome.offscreen.createDocument({
       url: 'background/offscreen.html',
-      reasons: ['DOM_SCRAPING', 'BLOBS', 'CLIPBOARD'],
-      justification: 'Stitch screenshots on canvas and optionally copy the result to the clipboard',
+      reasons: ['DOM_SCRAPING', 'BLOBS'],
+      justification: 'Stitch screenshots on a canvas before exporting them',
     });
     console.log('[SnapLong] Offscreen created');
     await sleep(300);
@@ -397,40 +395,21 @@ async function releaseOffscreen() {
 }
 
 async function handleCopyToClipboard(request, sendResponse) {
-  let offscreenLease = false;
   try {
-    if (typeof request.dataUrl !== 'string' || !request.dataUrl.startsWith('data:')) {
+    if (!Number.isInteger(request.tabId)) {
+      throw new Error('没有可复制的目标标签页');
+    }
+    if (typeof request.dataUrl !== 'string' || !request.dataUrl.startsWith('data:image/png')) {
       throw new Error('没有可复制的截图数据');
     }
 
-    await acquireOffscreen();
-    offscreenLease = true;
-    const result = await chrome.runtime.sendMessage({
-      action: 'writeClipboard',
-      target: 'offscreen',
-      dataUrl: request.dataUrl,
-    });
-    if (!result?.success) {
-      throw new Error(result?.error || '剪贴板写入失败');
-    }
-    sendResponse({ success: true, clipboardCopied: true });
+    const result = await writeClipboardToTab(request.tabId, request.dataUrl);
+    sendResponse(result);
   } catch (error) {
     console.error('[SnapLong] Clipboard error:', error);
-    sendResponse({ success: false, clipboardCopied: false, error: error.message });
-  } finally {
-    if (offscreenLease) await releaseOffscreen();
-    if (!captureState.isCapturing) await closeOffscreen();
+    const message = error?.message || '剪贴板写入失败';
+    sendResponse({ success: false, clipboardCopied: false, clipboardError: message, error: message });
   }
-}
-
-async function waitForClipboardInOffscreen(taskId) {
-  const result = await chrome.runtime.sendMessage({
-    action: 'waitClipboard',
-    target: 'offscreen',
-    taskId,
-  });
-  if (!result) throw new Error('剪贴板任务没有返回结果');
-  return result;
 }
 
 async function handleDownloadViewport(request, sendResponse) {
@@ -459,6 +438,68 @@ function sendMessageToTab(tabId, message) {
       chrome.runtime.lastError ? reject(new Error(chrome.runtime.lastError.message)) : resolve(r);
     });
   });
+}
+
+async function writeClipboardToTab(tabId, dataUrl) {
+  if (!Number.isInteger(tabId)) throw new Error('没有可复制的目标标签页');
+  if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:image/png')) {
+    throw new Error('没有可复制的 PNG 图片');
+  }
+
+  const tab = await chrome.tabs.get(tabId);
+  if (!tab?.active) throw new Error('复制前请保持目标页面处于当前活动标签页');
+
+  const results = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: writePngToPageClipboard,
+    args: [dataUrl],
+  });
+  const result = results?.[0]?.result;
+  if (!result?.success) {
+    const message = result?.clipboardError || result?.error || '剪贴板写入失败';
+    throw new Error(message);
+  }
+  return result;
+}
+
+// This function runs in the active tab. Clipboard API writes from an Offscreen
+// document are unreliable because that document cannot receive focus.
+async function writePngToPageClipboard(dataUrl) {
+  try {
+    if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:image/png')) {
+      throw new Error('没有可复制的 PNG 图片');
+    }
+    if (window.isSecureContext === false) {
+      throw new Error('当前页面不支持图片剪贴板，请在 HTTPS 页面重试');
+    }
+    if (!navigator.clipboard || typeof navigator.clipboard.write !== 'function') {
+      throw new Error('当前页面不支持图片剪贴板，请在 HTTPS 页面重试');
+    }
+
+    const ClipboardItemConstructor = globalThis.ClipboardItem;
+    if (typeof ClipboardItemConstructor !== 'function') {
+      throw new Error('当前浏览器不支持 PNG 剪贴板');
+    }
+    if (typeof ClipboardItemConstructor.supports === 'function' &&
+        !ClipboardItemConstructor.supports('image/png')) {
+      throw new Error('当前浏览器不支持 PNG 剪贴板');
+    }
+
+    const response = await fetch(dataUrl);
+    if (!response.ok) throw new Error('无法读取截图数据');
+    const blob = await response.blob();
+    const pngBlob = blob.type === 'image/png' ? blob : new Blob([blob], { type: 'image/png' });
+    await navigator.clipboard.write([
+      new ClipboardItemConstructor({ 'image/png': pngBlob }),
+    ]);
+    return { success: true, clipboardCopied: true, clipboardError: '' };
+  } catch (error) {
+    let message = error?.message || '剪贴板写入失败';
+    if (error?.name === 'NotAllowedError') {
+      message = '浏览器拒绝了图片剪贴板写入，请保持目标页面处于活动状态后重试';
+    }
+    return { success: false, clipboardCopied: false, clipboardError: message, error: message };
+  }
 }
 
 async function getPageInfoFromTab(tabId) {
