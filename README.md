@@ -2,7 +2,7 @@
 
 SnapLong 是一款 Edge 浏览器长截图扩展。它可以滚动截取整页或指定滚动面板，自动拼接截图，并导出 PNG、JPEG 或 PDF。
 
-**当前正式版：**[v1.3.2](https://github.com/Ludy258/SnapLong/releases/tag/v1.3.2) - 稳定性与回归测试补强。
+**当前正式版：**[v1.3.4](https://github.com/Ludy258/SnapLong/releases/tag/v1.3.4) - 图片剪贴板复制稳定性修复。
 
 ## 功能
 
@@ -32,6 +32,8 @@ SnapLong 是一款 Edge 浏览器长截图扩展。它可以滚动截取整页�
 
 截图期间请保持目标标签页处于活动状态。浏览器仅允许对当前可见标签页进行截图。
 
+使用弹窗截图并开启自动复制时，扩展会将最终截图以标准 PNG 图片写入系统剪贴板；选择 JPEG 或 PDF 时，下载文件仍保持所选格式。快捷键截图、关闭弹窗、`http://` 页面、Edge 内置页面或截图过程中切换标签页时，浏览器可能拒绝剪贴板写入，但文件下载不会受影响。
+
 ## 多滚动区域
 
 当 SnapLong 检测到多个符合条件的滚动区域时，弹窗会显示“滚动区域”列表。
@@ -57,7 +59,7 @@ SnapLong 是一款 Edge 浏览器长截图扩展。它可以滚动截取整页�
 
 - Service Worker 将 `captureVisibleTab()` 限制为每 500 ms 一次，并会重试失败的截图。
 - 每个选中的滚动区域都有独立的滚动计划和拼接结果。
-- 开启剪贴板选项后，最终截图会以标准 PNG 图片写入系统剪贴板；即使导出格式选择 JPEG 或 PDF，下载格式也不变。
+- 开启剪贴板选项后，扩展弹窗负责将最终截图转换为标准 PNG 并写入系统剪贴板；下载格式与剪贴板格式相互独立。
 - 成功、失败或中断后，扩展都会恢复原始滚动位置和临时隐藏的固定元素。
 
 ## 已知限制
@@ -66,7 +68,7 @@ SnapLong 是一款 Edge 浏览器长截图扩展。它可以滚动截取整页�
 - 多区域截图的耗时约等于所有区域帧数之和乘以所选延迟。
 - PDF 是光栅化输出，内容不可作为文本选择。
 - 如果页面在截图期间动态移动或调整面板尺寸，扩展会中止本次截图并恢复页面状态，建议稳定页面后重试。
-- 剪贴板复制需要 `clipboardWrite` 权限；系统剪贴板或目标应用不接受超大图片时，文件仍会正常保存，但剪贴板可能复制失败。
+- 剪贴板复制需要 `clipboardWrite` 权限和当前页面/扩展上下文允许写入；系统剪贴板或目标应用不接受超大图片时，文件仍会正常保存，但剪贴板可能复制失败。
 
 ## 快捷键
 
@@ -90,12 +92,23 @@ Compress-Archive -Path 'edge-extension/*' -DestinationPath 'SnapLong-extension.z
 
 ## 回归测试
 
-可直接打开 `tests/fixtures/` 下的静态页面，验证并列、嵌套、重叠、动态布局和懒加载内容的截图行为。具体步骤和预期结果见 [tests/README.md](tests/README.md)；`node tests/verify-content-logic.mjs` 可校验核心候选筛选与布局漂移规则，`node tests/verify-clipboard-logic.mjs` 可校验剪贴板和拼接坐标逻辑，`node tests/verify-service-worker-logic.mjs` 可校验 offscreen 生命周期与可视区域下载逻辑，`node tests/verify-extension-assets.mjs` 可校验扩展资源引用完整性，`node tests/verify-lazy-scroll-logic.mjs` 可校验懒加载后的尺寸刷新和位置恢复。
+可直接打开 `tests/fixtures/` 下的静态页面，验证并列、嵌套、重叠、动态布局和懒加载内容的截图行为。具体步骤和预期结果见 [tests/README.md](tests/README.md)。
+
+```powershell
+node tests/verify-content-logic.mjs
+node tests/verify-clipboard-logic.mjs
+node tests/verify-service-worker-logic.mjs
+node tests/verify-extension-assets.mjs
+node tests/verify-lazy-scroll-logic.mjs
+```
+
+这些检查分别覆盖滚动区域筛选与布局变化、剪贴板写入与拼接坐标、后台生命周期与下载、扩展资源引用，以及懒加载后的尺寸刷新。
 
 ## 更新记录
 
 | 版本 | 说明 |
 |---|---|
+| **v1.3.4** | 修复图片剪贴板复制流程；优先使用扩展弹窗上下文写入标准 PNG，复制失败时不影响文件下载。 |
 | **v1.3.2** | 多容器选择去重、懒加载高度稳定、动态布局检测、截图生命周期与导出容错，以及回归测试补强。 |
 | **v1.3.1** | 截图稳定性优化、新的紧凑弹窗和图标、多区域控件对齐及减少动态效果支持。 |
 | v1.3.0 | 多区域截图、上下文合成和固定页眉页脚保留。 |
